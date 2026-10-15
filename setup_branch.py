@@ -26,12 +26,13 @@ from branch_config import (
 
 class BranchSetupApp:
     PREVIEW_WIDTH = 960
-    PREVIEW_HEIGHT = 540
+    PREVIEW_HEIGHT = 300
 
     def __init__(self, root):
         self.root = root
         self.root.title("People Counter - Branch Setup")
-        self.root.minsize(1050, 790)
+        # Fit the full form, including the action buttons, on 1366x768 screens.
+        self.root.minsize(900, 600)
         self.config = load_branch_config()
         self.frame = None
         self.photo = None
@@ -312,8 +313,9 @@ class BranchSetupApp:
         if self.frame is None:
             return
         self.root.update_idletasks()
-        canvas_w = max(self.PREVIEW_WIDTH, self.canvas.winfo_width())
-        canvas_h = max(self.PREVIEW_HEIGHT, self.canvas.winfo_height())
+        # Use the space Tk actually allocated instead of forcing a 960x540 preview.
+        canvas_w = max(1, self.canvas.winfo_width())
+        canvas_h = max(1, self.canvas.winfo_height())
         height, width = self.frame.shape[:2]
         self.image_scale = min(canvas_w / width, canvas_h / height)
         shown_w = max(1, int(width * self.image_scale))

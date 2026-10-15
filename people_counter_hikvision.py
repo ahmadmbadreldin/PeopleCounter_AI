@@ -879,8 +879,19 @@ class StoreCounter:
 
         band_top = int(line_y - hysteresis)
         band_bottom = int(line_y + hysteresis)
-        cv2.rectangle(frame, (zone[0], band_top), (zone[2], band_bottom), (255, 180, 0), 1)
-        cv2.line(frame, (zone[0], int(line_y)), (zone[2], int(line_y)), (0, 255, 0), 2)
+        cv2.rectangle(frame, (zone[0], band_top), (zone[2], band_bottom), (255, 180, 0), 2)
+
+        # High-contrast counting line: the black border keeps it visible on
+        # bright floors and the green center keeps its meaning obvious.
+        line_y_int = int(line_y)
+        cv2.line(frame, (zone[0], line_y_int), (zone[2], line_y_int), (0, 0, 0), 8)
+        cv2.line(frame, (zone[0], line_y_int), (zone[2], line_y_int), (0, 255, 0), 4)
+        line_label_x = zone[0] + 8
+        line_label_y = max(24, line_y_int - 12)
+        cv2.putText(frame, "COUNTING LINE", (line_label_x, line_label_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 5)
+        cv2.putText(frame, "COUNTING LINE", (line_label_x, line_label_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         for track in tracks:
             x, y, w, h = track.get_bbox()
@@ -910,25 +921,36 @@ class StoreCounter:
             cv2.putText(frame, label, (x1, max(15, y1 - 7)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1)
 
-        panel_x = max(0, frame.shape[1] - 255)
+        panel_width = min(400, max(320, frame.shape[1] - 20))
+        panel_height = 270
+        panel_x = max(10, frame.shape[1] - panel_width - 10)
         panel_y = 10
-        cv2.rectangle(frame, (panel_x, panel_y), (panel_x + 245, panel_y + 170), (0, 0, 0), -1)
-        cv2.putText(frame, "STORE COUNTER", (panel_x + 10, panel_y + 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-        cv2.putText(frame, f"IN: {self.total_in}", (panel_x + 10, panel_y + 48),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
-        cv2.putText(frame, f"OUT: {self.total_out}", (panel_x + 10, panel_y + 72),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
-        cv2.putText(frame, f"INSIDE: {current_inside}", (panel_x + 10, panel_y + 96),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
-        cv2.putText(frame, f"FPS: {self.fps:.1f}", (panel_x + 125, panel_y + 48),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.rectangle(frame, (panel_x, panel_y),
+                      (panel_x + panel_width, panel_y + panel_height), (0, 0, 0), -1)
+        cv2.rectangle(frame, (panel_x, panel_y),
+                      (panel_x + panel_width, panel_y + panel_height), (255, 255, 255), 2)
+        cv2.putText(frame, "STORE COUNTER", (panel_x + 16, panel_y + 34),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.82, (255, 255, 255), 2)
+        cv2.putText(frame, f"FPS: {self.fps:.1f}", (panel_x + panel_width - 105, panel_y + 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+        cv2.line(frame, (panel_x + 12, panel_y + 48),
+                 (panel_x + panel_width - 12, panel_y + 48), (100, 100, 100), 1)
+
+        metric_font = cv2.FONT_HERSHEY_SIMPLEX
+        metric_scale = 0.82
+        metric_thickness = 2
+        cv2.putText(frame, f"IN: {self.total_in}", (panel_x + 16, panel_y + 82),
+                    metric_font, metric_scale, (0, 255, 0), metric_thickness)
+        cv2.putText(frame, f"OUT: {self.total_out}", (panel_x + 16, panel_y + 122),
+                    metric_font, metric_scale, (0, 0, 255), metric_thickness)
+        cv2.putText(frame, f"INSIDE: {current_inside}", (panel_x + 16, panel_y + 162),
+                    metric_font, metric_scale, (0, 255, 255), metric_thickness)
         cv2.putText(frame, f"STAFF IGNORED: {self.staff_ignored}",
-                    (panel_x + 10, panel_y + 120), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45, (255, 0, 255), 1)
+                    (panel_x + 16, panel_y + 202), metric_font,
+                    metric_scale, (255, 0, 255), metric_thickness)
         cv2.putText(frame, f"UNKNOWN: {self.unknown_crossings}",
-                    (panel_x + 10, panel_y + 143), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45, (0, 200, 255), 1)
+                    (panel_x + 16, panel_y + 242), metric_font,
+                    metric_scale, (0, 200, 255), metric_thickness)
 
         return frame
 
