@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+Ultralytics/
+logs/
+branches/
+
+# Contains the local camera password and branch-specific geometry.
+branch_config.json
