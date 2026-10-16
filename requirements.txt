@@ -1,5 +1,5 @@
 ultralytics
-opencv-python
+opencv-python>=5.0.0
 numpy
 scipy
 filterpy

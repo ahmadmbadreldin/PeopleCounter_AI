@@ -2,13 +2,14 @@
 
 import base64
 from copy import deepcopy
+import os
 from pathlib import Path
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 from queue import Empty, Queue
 
 import cv2
@@ -159,6 +160,9 @@ class BranchSetupApp:
             side="right", padx=(8, 0)
         )
         ttk.Button(footer, text="Save & Start", command=self._save_and_start).pack(side="right")
+        ttk.Button(footer, text="Enroll Staff", command=self._enroll_staff).pack(
+            side="right", padx=(0, 8)
+        )
 
         ttk.Label(
             outer,
@@ -472,6 +476,73 @@ class BranchSetupApp:
         self.status_var.set(f"Saved {branch_path.name}. Starting counter...")
         self.start_requested = True
         self.root.after(250, self.root.destroy)
+
+    def _enroll_staff(self):
+        try:
+            config = self._form_config()
+            validate_config(config)
+            _, branch_path = save_branch_config(config)
+        except (ValueError, OSError, RuntimeError) as exc:
+            messagebox.showerror(
+                "Cannot enroll staff",
+                f"Save valid camera and entrance settings first.\n\n{exc}",
+            )
+            return
+
+        employee_id = simpledialog.askstring(
+            "Staff enrollment",
+            "Enter the employee name or code:",
+            parent=self.root,
+        )
+        if not employee_id or not employee_id.strip():
+            return
+        consent = messagebox.askyesno(
+            "Employee consent",
+            "Confirm that this employee has agreed to biometric face enrollment.",
+            parent=self.root,
+        )
+        if not consent:
+            return
+
+        self.config = config
+        self.status_var.set(f"Starting staff enrollment for {employee_id.strip()}...")
+        self.root.withdraw()
+        result = None
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(PROJECT_DIR / "staff_enrollment.py"),
+                    "--employee-id",
+                    employee_id.strip(),
+                ],
+                cwd=str(PROJECT_DIR),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            )
+        except OSError as exc:
+            messagebox.showerror(
+                "Staff enrollment",
+                f"Could not start staff enrollment:\n{exc}",
+                parent=self.root,
+            )
+            return
+        finally:
+            self.root.deiconify()
+            self.root.lift()
+
+        if result is None:
+            return
+        output = (result.stdout or result.stderr or "Enrollment did not return details.").strip()
+        if result.returncode == 0:
+            self.status_var.set(output)
+            messagebox.showinfo("Staff enrollment complete", output, parent=self.root)
+        else:
+            self.status_var.set("Staff enrollment was not completed.")
+            messagebox.showerror("Staff enrollment", output, parent=self.root)
 
     def _start_saved(self):
         try:

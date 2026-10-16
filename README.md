@@ -22,7 +22,10 @@ opens the branch setup screen. In that screen:
    entrance. The green line at its center is the crossing line.
 4. Select whether entering moves from top to bottom or bottom to top in the
    image.
-5. Click **Save & Start**.
+5. With the employee's consent, click **Enroll Staff**, enter the employee
+   name/code, and follow the on-screen FRONT/LEFT/RIGHT prompts. Repeat for
+   every employee in that branch.
+6. Click **Save & Start**.
 
 The active configuration is written to `branch_config.json`. A separate copy
 is also written to `branches/<branch_id>.json`, so the setup screen can load an
@@ -61,22 +64,31 @@ requires a saved, calibrated configuration with a camera password.
 - `INSIDE` is `max(0, IN - OUT)`. It is an estimate, not proof of physical
   occupancy.
 
-## Staff filtering (demo mode)
+## Hybrid staff filtering and enrollment
 
-Staff filtering uses
-`WhatsApp Image 2026-10-15 at 10.16.27 AM.jpeg` as the logo reference. It
-combines a white-torso check, magenta accent evidence, geometric logo feature
-matching, and multi-frame voting. A white shirt by itself is never staff.
+Staff filtering combines per-branch face recognition with the actual white
+shirt/chest-logo appearance captured during enrollment. OpenCV YuNet detects
+faces and SFace creates normalized embeddings. Raw face images are not stored;
+the employee code and embeddings are saved in:
+
+```text
+branches/<branch_id>/staff_faces.npz
+```
+
+Chest-only uniform references are stored in
+`branches/<branch_id>/uniform_refs/`. Re-enrolling the same employee code
+replaces that employee's old face and uniform samples.
 
 If a person crosses before staff classification is ready, the crossing waits
-briefly for more frames. Confirmed staff crossings become
-`STAFF_IN_IGNORED`/`STAFF_OUT_IGNORED`. A still-uncertain crossing is counted as
-a customer and logged as `IN_UNKNOWN`/`OUT_UNKNOWN`, avoiding accidental
-visitor exclusion.
+for up to 2.5 seconds for more face/uniform evidence. Confirmed staff crossings
+become `STAFF_IN_IGNORED`/`STAFF_OUT_IGNORED`. Because missing a staff member is
+the system keeps collecting evidence before deciding. If the crossing is still
+unresolved after the timeout, it is counted as a customer and logged as
+`IN_UNKNOWN_COUNTED` or `OUT_UNKNOWN_COUNTED`.
 
-This reference-based fallback cannot reliably recognize staff when the logo is
-too small, blurred, occluded, or invisible from the camera angle. It must be
-tested at every real entrance.
+Face and uniform quality still depend on camera angle, face size, lighting,
+blur, and occlusion. Enrollment must use the final installed camera, and every
+branch must be validated with consenting employees and test visitors.
 
 ## Tests
 
@@ -85,7 +97,8 @@ tested at every real entrance.
 ```
 
 The offline tests validate crossing state, direction reversal, staff evidence
-aggregation, pending event decisions, and configuration validation. They do
+aggregation, face-profile persistence, pending event decisions, and
+configuration validation. They do
 not validate real YOLO accuracy, live RTSP reliability, or a particular camera
 angle.
 
@@ -97,6 +110,8 @@ angle.
   can cause count errors.
 - Counters restart from zero when the app restarts; previous Excel events are
   retained but are not used to restore state.
-- Staff detection has no real-camera training data and is a demo heuristic.
+- Face matching is biometric processing. Obtain appropriate consent, restrict
+  access to each branch profile, and delete a profile when it is no longer
+  needed.
 - The application must be validated against manually counted entrance trials
   before its numbers are used.

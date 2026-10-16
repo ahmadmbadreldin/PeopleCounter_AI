@@ -33,6 +33,7 @@ class StaffUniformDetector:
     def __init__(
         self,
         reference_path,
+        enrollment_reference_dir=None,
         enabled=True,
         min_person_width=70,
         min_person_height=130,
@@ -49,6 +50,9 @@ class StaffUniformDetector:
     ):
         self.enabled = bool(enabled)
         self.reference_path = Path(reference_path)
+        self.enrollment_reference_dir = (
+            Path(enrollment_reference_dir) if enrollment_reference_dir else None
+        )
         self.min_person_width = int(min_person_width)
         self.min_person_height = int(min_person_height)
         self.white_min_ratio = float(white_min_ratio)
@@ -66,6 +70,7 @@ class StaffUniformDetector:
         self.reference_gray = None
         self.reference_keypoints = []
         self.reference_descriptors = None
+        self.reference_features = []
         self.load_error = None
 
         if self.enabled:
@@ -75,8 +80,7 @@ class StaffUniformDetector:
     def ready(self):
         return (
             self.enabled
-            and self.reference_descriptors is not None
-            and len(self.reference_keypoints) >= self.min_feature_matches
+            and bool(self.reference_features)
         )
 
     @staticmethod
@@ -103,22 +107,35 @@ class StaffUniformDetector:
         return cv2.imdecode(encoded, cv2.IMREAD_COLOR)
 
     def _load_reference(self):
-        image = self._read_image(self.reference_path)
-        if image is None:
-            self.load_error = f"Unable to read staff logo reference: {self.reference_path}"
-            self.enabled = False
-            return
-        image = self._crop_nonwhite(image)
-        longest = max(image.shape[:2])
-        if longest > 900:
-            scale = 900.0 / longest
-            image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        self.reference_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        self.reference_keypoints, self.reference_descriptors = self.orb.detectAndCompute(
-            self.reference_gray, None
-        )
-        if self.reference_descriptors is None:
-            self.load_error = f"No usable features found in staff logo: {self.reference_path}"
+        paths = [self.reference_path]
+        if self.enrollment_reference_dir and self.enrollment_reference_dir.exists():
+            for pattern in ("*.jpg", "*.jpeg", "*.png"):
+                paths.extend(sorted(self.enrollment_reference_dir.glob(pattern)))
+
+        for path in paths:
+            image = self._read_image(path)
+            if image is None:
+                continue
+            # Keep the original supplied logo tightly cropped.  Enrollment
+            # references are already chest-only crops from the branch camera.
+            if path == self.reference_path:
+                image = self._crop_nonwhite(image)
+            longest = max(image.shape[:2])
+            if longest > 900:
+                scale = 900.0 / longest
+                image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            keypoints, descriptors = self.orb.detectAndCompute(gray, None)
+            if descriptors is None or len(keypoints) < self.min_feature_matches:
+                continue
+            self.reference_features.append((keypoints, descriptors))
+            if self.reference_descriptors is None:
+                self.reference_gray = gray
+                self.reference_keypoints = keypoints
+                self.reference_descriptors = descriptors
+
+        if not self.reference_features:
+            self.load_error = f"No usable uniform references found for: {self.reference_path}"
             self.enabled = False
 
     @staticmethod
@@ -145,26 +162,33 @@ class StaffUniformDetector:
             return 0, 0, 0.0
 
         matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
-        pairs = matcher.knnMatch(self.reference_descriptors, descriptors, k=2)
-        good = []
-        for pair in pairs:
-            if len(pair) == 2 and pair[0].distance < 0.72 * pair[1].distance:
-                good.append(pair[0])
-        if len(good) < 4:
-            return len(good), 0, 0.0
+        best = (0, 0, 0.0)
+        for reference_keypoints, reference_descriptors in self.reference_features:
+            pairs = matcher.knnMatch(reference_descriptors, descriptors, k=2)
+            good = []
+            for pair in pairs:
+                if len(pair) == 2 and pair[0].distance < 0.72 * pair[1].distance:
+                    good.append(pair[0])
+            if len(good) < 4:
+                if len(good) > best[0]:
+                    best = (len(good), 0, 0.0)
+                continue
 
-        source = np.float32(
-            [self.reference_keypoints[m.queryIdx].pt for m in good]
-        ).reshape(-1, 1, 2)
-        target = np.float32([keypoints[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-        try:
-            _, mask = cv2.findHomography(source, target, cv2.RANSAC, 5.0)
-        except cv2.error:
-            mask = None
-        inliers = int(mask.sum()) if mask is not None else 0
-        match_strength = min(1.0, len(good) / max(1, self.min_feature_matches))
-        inlier_strength = min(1.0, inliers / max(1, self.min_feature_inliers))
-        return len(good), inliers, match_strength * inlier_strength
+            source = np.float32(
+                [reference_keypoints[m.queryIdx].pt for m in good]
+            ).reshape(-1, 1, 2)
+            target = np.float32([keypoints[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+            try:
+                _, mask = cv2.findHomography(source, target, cv2.RANSAC, 5.0)
+            except cv2.error:
+                mask = None
+            inliers = int(mask.sum()) if mask is not None else 0
+            match_strength = min(1.0, len(good) / max(1, self.min_feature_matches))
+            inlier_strength = min(1.0, inliers / max(1, self.min_feature_inliers))
+            candidate = (len(good), inliers, match_strength * inlier_strength)
+            if candidate[2] > best[2]:
+                best = candidate
+        return best
 
     def analyze(self, frame, bbox):
         if not self.ready:

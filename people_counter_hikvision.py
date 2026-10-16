@@ -23,6 +23,7 @@ import numpy as np
 from ultralytics import YOLO
 from filterpy.kalman import KalmanFilter
 from scipy.optimize import linear_sum_assignment
+from staff_face import StaffFaceRecognizer
 from staff_uniform import StaffUniformDetector
 from branch_config import load_branch_config, resolve_project_path, validate_config
 
@@ -78,13 +79,37 @@ class Config:
     staff_logo_reference: str = str(resolve_project_path(
         _setting("staff", "logo_reference", "WhatsApp Image 2026-10-15 at 10.16.27 AM.jpeg")
     ))
+    staff_enrollment_reference_dir: str = str(resolve_project_path(
+        _setting("staff", "enrollment_reference_dir", "")
+        or f"branches/{_BRANCH_CONFIG.get('branch_id', 'default_branch')}/uniform_refs"
+    ))
     staff_min_person_width: int = int(_setting("staff", "min_person_width", 70))
     staff_min_person_height: int = int(_setting("staff", "min_person_height", 130))
     staff_white_min_ratio: float = float(_setting("staff", "white_min_ratio", 0.30))
     staff_frame_threshold: float = float(_setting("staff", "frame_threshold", 0.62))
     staff_track_threshold: float = float(_setting("staff", "track_threshold", 0.68))
     staff_min_positive_frames: int = int(_setting("staff", "min_positive_frames", 3))
-    staff_decision_timeout_s: float = float(_setting("staff", "decision_timeout_s", 1.25))
+    staff_decision_timeout_s: float = float(_setting("staff", "decision_timeout_s", 2.50))
+
+    # ---------- Per-branch staff face recognition ----------
+    face_detection_enabled: bool = bool(_setting("face", "enabled", True))
+    face_detector_model: str = str(resolve_project_path(
+        _setting("face", "detector_model", "models/face_detection_yunet_2026may.onnx")
+    ))
+    face_recognizer_model: str = str(resolve_project_path(
+        _setting("face", "recognizer_model", "models/face_recognition_sface_2021dec.onnx")
+    ))
+    face_profile_file: str = str(resolve_project_path(
+        _setting("face", "profile_file", "")
+        or f"branches/{_BRANCH_CONFIG.get('branch_id', 'default_branch')}/staff_faces.npz"
+    ))
+    face_match_threshold: float = float(_setting("face", "match_threshold", 0.36))
+    face_support_threshold: float = float(_setting("face", "support_threshold", 0.29))
+    face_min_size: int = int(_setting("face", "min_face_size", 38))
+    face_min_positive_frames: int = int(_setting("face", "min_positive_frames", 2))
+    face_process_every_n_frames: int = max(
+        1, int(_setting("face", "process_every_n_frames", 2))
+    )
 
     # ---------- Counting geometry ----------
     base_width: int = int(_setting("counting", "base_width", 1280))
@@ -361,7 +386,13 @@ class Track:
         self.staff_scores = deque(maxlen=20)
         self.staff_score = 0.0
         self.staff_status = "UNKNOWN"
+        self.uniform_status = "UNKNOWN"
         self.staff_last_evidence = None
+        self.face_scores = deque(maxlen=24)
+        self.face_score = 0.0
+        self.face_employee = ""
+        self.face_observations = 0
+        self.face_last_evidence = None
         self.update_small_object_status()
 
     def update_small_object_status(self, min_width=30, min_height=30):
@@ -650,6 +681,7 @@ class StoreCounter:
         )
         self.staff_detector = StaffUniformDetector(
             reference_path=cfg.staff_logo_reference,
+            enrollment_reference_dir=cfg.staff_enrollment_reference_dir,
             enabled=cfg.staff_detection_enabled,
             min_person_width=cfg.staff_min_person_width,
             min_person_height=cfg.staff_min_person_height,
@@ -664,6 +696,27 @@ class StoreCounter:
             print(
                 "WARNING: Staff uniform detection disabled: "
                 f"{self.staff_detector.load_error or 'reference has too few features'}"
+            )
+
+        self.face_recognizer = StaffFaceRecognizer(
+            detector_model=cfg.face_detector_model,
+            recognizer_model=cfg.face_recognizer_model,
+            profile_file=cfg.face_profile_file,
+            enabled=cfg.face_detection_enabled,
+            match_threshold=cfg.face_match_threshold,
+            support_threshold=cfg.face_support_threshold,
+            min_face_size=cfg.face_min_size,
+            min_positive_frames=cfg.face_min_positive_frames,
+        )
+        if self.face_recognizer.ready:
+            print(
+                "Staff face recognition enabled: "
+                f"{self.face_recognizer.enrolled_employee_count} employee(s)"
+            )
+        elif cfg.face_detection_enabled:
+            print(
+                "Staff face recognition waiting for enrollment: "
+                f"{self.face_recognizer.load_error or cfg.face_profile_file}"
             )
 
         self.total_in = 0
@@ -772,7 +825,17 @@ class StoreCounter:
                 self.ignored_small_track_ids.add(track.track_id)
                 continue
             evidence = self.staff_detector.analyze(frame, track.last_observed_bbox)
-            self.staff_detector.update_track(track, evidence)
+            track.uniform_status = self.staff_detector.update_track(track, evidence)
+
+            if (
+                self.face_recognizer.ready
+                and self.frame_counter % self.cfg.face_process_every_n_frames == 0
+            ):
+                face_evidence = self.face_recognizer.analyze(
+                    frame, track.last_observed_bbox
+                )
+                self.face_recognizer.update_track(track, face_evidence)
+            self._update_hybrid_staff_status(track)
 
         self._resolve_pending_crossings(now)
 
@@ -804,6 +867,53 @@ class StoreCounter:
         self.peak_inside = max(self.peak_inside, current_inside)
 
         return self.draw(frame, tracks, zone, line_y, hysteresis, current_inside)
+
+    def _update_hybrid_staff_status(self, track):
+        """Favor staff recall while requiring repeated track-level evidence."""
+        if not self.face_recognizer.ready:
+            track.staff_status = track.uniform_status
+            return track.staff_status
+
+        matching_scores = [
+            score for score, employee_id in track.face_scores
+            if employee_id == track.face_employee
+        ]
+        face_positive_frames = sum(
+            score >= self.cfg.face_match_threshold for score in matching_scores
+        )
+        face_confirmed = (
+            face_positive_frames >= self.cfg.face_min_positive_frames
+            or any(
+                score >= self.cfg.face_match_threshold + 0.08
+                for score in matching_scores
+            )
+        )
+        face_support = (
+            len(matching_scores) >= self.cfg.face_min_positive_frames
+            and track.face_score >= self.cfg.face_support_threshold
+        )
+        last_uniform = track.staff_last_evidence
+        white_support = bool(
+            last_uniform is not None
+            and last_uniform.usable
+            and last_uniform.white_ratio >= self.cfg.staff_white_min_ratio
+        )
+
+        if (
+            face_confirmed
+            or track.uniform_status == "STAFF"
+            or (face_support and white_support)
+        ):
+            track.staff_status = "STAFF"
+        elif (
+            track.face_observations >= 3
+            and track.face_score < self.cfg.face_support_threshold
+            and track.uniform_status == "CUSTOMER"
+        ):
+            track.staff_status = "CUSTOMER"
+        else:
+            track.staff_status = "UNKNOWN"
+        return track.staff_status
 
     def _handle_crossing(self, track, event, now):
         if track.staff_status == "STAFF":
@@ -848,7 +958,7 @@ class StoreCounter:
             self.total_out += 1
             self.inside_ids.discard(track.track_id)
             self.inside_timestamps.pop(track.track_id, None)
-        log_event = event if person_type == "CUSTOMER" else f"{event}_UNKNOWN"
+        log_event = event if person_type == "CUSTOMER" else f"{event}_UNKNOWN_COUNTED"
         self._log_event(track.track_id, log_event)
 
     def _log_event(self, track_id, event, play_alert=True):
@@ -914,7 +1024,9 @@ class StoreCounter:
             side = track.count_side or "?"
             label = f"ID:{track.track_id} {side}"
             if self.staff_detector.ready:
-                label += f" {track.staff_status}:{track.staff_score:.2f}"
+                label += f" {track.staff_status} U:{track.staff_score:.2f}"
+            if self.face_recognizer.ready and track.face_employee:
+                label += f" F:{track.face_employee}:{track.face_score:.2f}"
             if track.last_event:
                 label += f" {track.last_event}"
 
@@ -948,7 +1060,7 @@ class StoreCounter:
         cv2.putText(frame, f"STAFF IGNORED: {self.staff_ignored}",
                     (panel_x + 16, panel_y + 202), metric_font,
                     metric_scale, (255, 0, 255), metric_thickness)
-        cv2.putText(frame, f"UNKNOWN: {self.unknown_crossings}",
+        cv2.putText(frame, f"UNKNOWN COUNTED: {self.unknown_crossings}",
                     (panel_x + 16, panel_y + 242), metric_font,
                     metric_scale, (0, 200, 255), metric_thickness)
 

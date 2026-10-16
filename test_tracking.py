@@ -44,6 +44,7 @@ sys.modules[spec.name] = counter
 spec.loader.exec_module(counter)
 
 from staff_uniform import StaffEvidence, StaffUniformDetector
+from staff_face import StaffFaceRecognizer
 from branch_config import (
     DEFAULT_CONFIG,
     build_rtsp_url_from_config,
@@ -187,7 +188,7 @@ class CrossingDecisionTests(unittest.TestCase):
         store._log_event = lambda track_id, event, play_alert=True: store.logged.append(event)
         return store
 
-    def test_unknown_crossing_waits_then_counts_customer(self):
+    def test_unknown_crossing_waits_then_counts_as_customer(self):
         store = self.new_counter()
         track = counter.Track([150, 50, 100, 200], 7)
         store._handle_crossing(track, 'IN', 10.0)
@@ -197,7 +198,7 @@ class CrossingDecisionTests(unittest.TestCase):
         store._resolve_pending_crossings(11.3)
         self.assertEqual(store.total_in, 1)
         self.assertEqual(store.unknown_crossings, 1)
-        self.assertIn('IN_UNKNOWN', store.logged)
+        self.assertIn('IN_UNKNOWN_COUNTED', store.logged)
 
     def test_confirmed_staff_crossing_is_ignored(self):
         store = self.new_counter()
@@ -207,6 +208,52 @@ class CrossingDecisionTests(unittest.TestCase):
         self.assertEqual(store.total_in, 0)
         self.assertEqual(store.staff_ignored, 1)
         self.assertIn('STAFF_IN_IGNORED', store.logged)
+
+
+class HybridStaffDecisionTests(unittest.TestCase):
+    def new_counter(self):
+        store = counter.StoreCounter.__new__(counter.StoreCounter)
+        store.cfg = types.SimpleNamespace(
+            face_match_threshold=0.36,
+            face_support_threshold=0.29,
+            face_min_positive_frames=2,
+            staff_white_min_ratio=0.30,
+        )
+        store.face_recognizer = types.SimpleNamespace(ready=True)
+        return store
+
+    def test_repeated_face_match_marks_staff(self):
+        store = self.new_counter()
+        track = counter.Track([150, 250, 200, 400], 10)
+        track.uniform_status = 'CUSTOMER'
+        track.face_employee = 'employee_01'
+        track.face_scores.extend([(0.40, 'employee_01'), (0.41, 'employee_01')])
+        track.face_score = 0.405
+        track.face_observations = 2
+        self.assertEqual(store._update_hybrid_staff_status(track), 'STAFF')
+
+    def test_supporting_face_plus_white_uniform_marks_staff(self):
+        store = self.new_counter()
+        track = counter.Track([150, 250, 200, 400], 11)
+        track.uniform_status = 'CUSTOMER'
+        track.face_employee = 'employee_01'
+        track.face_scores.extend([(0.31, 'employee_01'), (0.32, 'employee_01')])
+        track.face_score = 0.315
+        track.face_observations = 2
+        track.staff_last_evidence = StaffEvidence(
+            score=0.1, white_ratio=0.60, usable=True
+        )
+        self.assertEqual(store._update_hybrid_staff_status(track), 'STAFF')
+
+    def test_repeated_negative_face_and_uniform_marks_customer(self):
+        store = self.new_counter()
+        track = counter.Track([150, 250, 200, 400], 12)
+        track.uniform_status = 'CUSTOMER'
+        track.face_employee = 'employee_01'
+        track.face_scores.extend([(0.10, 'employee_01'), (0.12, 'employee_01')])
+        track.face_score = 0.11
+        track.face_observations = 3
+        self.assertEqual(store._update_hybrid_staff_status(track), 'CUSTOMER')
 
 
 class BranchConfigTests(unittest.TestCase):
@@ -242,6 +289,22 @@ class BranchConfigTests(unittest.TestCase):
             self.assertTrue(active.exists())
             self.assertEqual(branch.name, 'branch_01.json')
             self.assertEqual(load_branch_config(branch)['branch_id'], 'branch_01')
+
+
+class FaceProfileTests(unittest.TestCase):
+    def test_employee_embeddings_are_saved_per_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / 'staff_faces.npz'
+            recognizer = StaffFaceRecognizer('', '', profile, enabled=False)
+            vectors = np.eye(3, 128, dtype=np.float32)
+            recognizer.save_employee('employee_01', vectors)
+            self.assertTrue(profile.exists())
+            self.assertEqual(recognizer.enrolled_employee_count, 1)
+            self.assertEqual(recognizer.embeddings.shape, (3, 128))
+
+            replacement = np.ones((2, 128), dtype=np.float32)
+            recognizer.save_employee('employee_01', replacement)
+            self.assertEqual(recognizer.embeddings.shape, (2, 128))
 
 if __name__ == '__main__':
     unittest.main()

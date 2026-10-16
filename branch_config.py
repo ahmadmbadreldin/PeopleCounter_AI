@@ -56,13 +56,25 @@ DEFAULT_CONFIG = {
     "staff": {
         "enabled": True,
         "logo_reference": "WhatsApp Image 2026-10-15 at 10.16.27 AM.jpeg",
+        "enrollment_reference_dir": "",
         "min_person_width": 70,
         "min_person_height": 130,
         "white_min_ratio": 0.30,
         "frame_threshold": 0.62,
         "track_threshold": 0.68,
         "min_positive_frames": 3,
-        "decision_timeout_s": 1.25,
+        "decision_timeout_s": 2.50,
+    },
+    "face": {
+        "enabled": True,
+        "detector_model": "models/face_detection_yunet_2026may.onnx",
+        "recognizer_model": "models/face_recognition_sface_2021dec.onnx",
+        "profile_file": "",
+        "match_threshold": 0.36,
+        "support_threshold": 0.29,
+        "min_face_size": 38,
+        "min_positive_frames": 2,
+        "process_every_n_frames": 2,
     },
     "logging": {
         "file": "logs/default_branch_store_log.xlsx",
@@ -150,6 +162,10 @@ def save_branch_config(config, active_path=ACTIVE_CONFIG_PATH, branches_dir=BRAN
     branch_id = validate_config(config)
     config["branch_id"] = branch_id
     config["logging"]["file"] = f"logs/{branch_id}_store_log.xlsx"
+    config["face"]["profile_file"] = f"branches/{branch_id}/staff_faces.npz"
+    config["staff"]["enrollment_reference_dir"] = (
+        f"branches/{branch_id}/uniform_refs"
+    )
 
     active_path = Path(active_path)
     branches_dir = Path(branches_dir)
