@@ -1,8 +1,8 @@
-"""Conservative, training-free staff-uniform detection.
+"""Per-branch staff-uniform detection.
 
-The detector intentionally requires both a mostly-white torso and geometric
-feature matches to the supplied company logo.  A single frame never decides a
-track: callers aggregate evidence over several observed frames.
+The detector requires both a mostly-white button-shirt chest and geometric
+feature matches to chest references captured during employee enrollment. A
+single frame never decides a track: callers aggregate evidence over time.
 """
 
 from dataclasses import dataclass
@@ -49,7 +49,7 @@ class StaffUniformDetector:
         history_size=20,
     ):
         self.enabled = bool(enabled)
-        self.reference_path = Path(reference_path)
+        self.reference_path = Path(reference_path) if reference_path else None
         self.enrollment_reference_dir = (
             Path(enrollment_reference_dir) if enrollment_reference_dir else None
         )
@@ -107,7 +107,9 @@ class StaffUniformDetector:
         return cv2.imdecode(encoded, cv2.IMREAD_COLOR)
 
     def _load_reference(self):
-        paths = [self.reference_path]
+        paths = []
+        if self.reference_path and self.reference_path.is_file():
+            paths.append(self.reference_path)
         if self.enrollment_reference_dir and self.enrollment_reference_dir.exists():
             for pattern in ("*.jpg", "*.jpeg", "*.png"):
                 paths.extend(sorted(self.enrollment_reference_dir.glob(pattern)))
@@ -118,7 +120,7 @@ class StaffUniformDetector:
                 continue
             # Keep the original supplied logo tightly cropped.  Enrollment
             # references are already chest-only crops from the branch camera.
-            if path == self.reference_path:
+            if self.reference_path and path == self.reference_path:
                 image = self._crop_nonwhite(image)
             longest = max(image.shape[:2])
             if longest > 900:
@@ -135,7 +137,7 @@ class StaffUniformDetector:
                 self.reference_descriptors = descriptors
 
         if not self.reference_features:
-            self.load_error = f"No usable uniform references found for: {self.reference_path}"
+            self.load_error = "No enrolled uniform references found for this branch."
             self.enabled = False
 
     @staticmethod
@@ -147,8 +149,11 @@ class StaffUniformDetector:
         person_y1 = cy - box_h / 2.0
         x1 = int(round(person_x1 + 0.08 * box_w))
         x2 = int(round(person_x1 + 0.92 * box_w))
-        y1 = int(round(person_y1 + 0.10 * box_h))
-        y2 = int(round(person_y1 + 0.68 * box_h))
+        # Focus on the formal shirt chest: below the face and above the belt.
+        # The real logo exists only on the front chest, so back views are left
+        # for face/track evidence rather than guessed from shirt colour alone.
+        y1 = int(round(person_y1 + 0.16 * box_h))
+        y2 = int(round(person_y1 + 0.64 * box_h))
         return (
             max(0, min(width, x1)),
             max(0, min(height, y1)),
@@ -207,7 +212,8 @@ class StaffUniformDetector:
             (hsv[:, :, 1] <= self.white_max_saturation)
             & (hsv[:, :, 2] >= self.white_min_value)
         )
-        # OpenCV hue for the supplied pink/magenta accent is near 160.
+        # Retained for diagnostics/backward-compatible logs only. The real
+        # embroidered chest logo is black, so magenta is not decision evidence.
         magenta = (
             (hsv[:, :, 0] >= 140)
             & (hsv[:, :, 0] <= 179)
@@ -227,10 +233,7 @@ class StaffUniformDetector:
                 0.0,
                 1.0,
             ))
-            magenta_score = float(np.clip(
-                magenta_ratio / max(self.magenta_min_ratio, 1e-6), 0.0, 1.0
-            ))
-            score = 0.30 * white_score + 0.50 * feature_score + 0.20 * magenta_score
+            score = 0.40 * white_score + 0.60 * feature_score
             if inliers < self.min_feature_inliers:
                 score *= 0.5
 

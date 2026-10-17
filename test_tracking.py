@@ -127,7 +127,15 @@ class TrackingTests(unittest.TestCase):
 class StaffUniformTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        reference = Path(__file__).with_name('WhatsApp Image 2026-10-15 at 10.16.27 AM.jpeg')
+        cls.reference_directory = tempfile.TemporaryDirectory()
+        reference = Path(cls.reference_directory.name) / 'logo.png'
+        logo = np.full((180, 180, 3), 255, dtype=np.uint8)
+        cv2.circle(logo, (90, 90), 58, (0, 0, 0), 8)
+        cv2.line(logo, (91, 28), (145, 58), (0, 0, 0), 7)
+        cv2.line(logo, (91, 152), (146, 122), (0, 0, 0), 7)
+        cv2.putText(logo, 'C', (48, 125), cv2.FONT_HERSHEY_SIMPLEX,
+                    2.6, (0, 0, 0), 6)
+        cv2.imwrite(str(reference), logo)
         cls.detector = StaffUniformDetector(
             reference,
             min_person_width=50,
@@ -136,6 +144,10 @@ class StaffUniformTests(unittest.TestCase):
             min_feature_inliers=4,
             min_positive_frames=3,
         )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.reference_directory.cleanup()
 
     def test_blank_white_shirt_is_not_staff(self):
         frame = np.full((500, 300, 3), 180, dtype=np.uint8)

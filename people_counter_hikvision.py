@@ -43,6 +43,11 @@ def _setting(section, key, default=None):
     return _BRANCH_CONFIG.get(section, {}).get(key, default)
 
 
+def _optional_project_path(value):
+    value = str(value or "").strip()
+    return str(resolve_project_path(value)) if value else ""
+
+
 @dataclass
 class Config:
     # Values come from branch_config.json, written by setup_branch.py.
@@ -76,9 +81,9 @@ class Config:
 
     # ---------- Staff uniform detection ----------
     staff_detection_enabled: bool = bool(_setting("staff", "enabled", True))
-    staff_logo_reference: str = str(resolve_project_path(
-        _setting("staff", "logo_reference", "WhatsApp Image 2026-10-15 at 10.16.27 AM.jpeg")
-    ))
+    staff_logo_reference: str = _optional_project_path(
+        _setting("staff", "logo_reference", "")
+    )
     staff_enrollment_reference_dir: str = str(resolve_project_path(
         _setting("staff", "enrollment_reference_dir", "")
         or f"branches/{_BRANCH_CONFIG.get('branch_id', 'default_branch')}/uniform_refs"
@@ -86,8 +91,8 @@ class Config:
     staff_min_person_width: int = int(_setting("staff", "min_person_width", 70))
     staff_min_person_height: int = int(_setting("staff", "min_person_height", 130))
     staff_white_min_ratio: float = float(_setting("staff", "white_min_ratio", 0.30))
-    staff_frame_threshold: float = float(_setting("staff", "frame_threshold", 0.62))
-    staff_track_threshold: float = float(_setting("staff", "track_threshold", 0.68))
+    staff_frame_threshold: float = float(_setting("staff", "frame_threshold", 0.56))
+    staff_track_threshold: float = float(_setting("staff", "track_threshold", 0.60))
     staff_min_positive_frames: int = int(_setting("staff", "min_positive_frames", 3))
     staff_decision_timeout_s: float = float(_setting("staff", "decision_timeout_s", 2.50))
 
@@ -691,7 +696,10 @@ class StoreCounter:
             min_positive_frames=cfg.staff_min_positive_frames,
         )
         if self.staff_detector.ready:
-            print(f"Staff uniform detection enabled: {cfg.staff_logo_reference}")
+            print(
+                "Staff uniform detection enabled from enrolled references: "
+                f"{cfg.staff_enrollment_reference_dir}"
+            )
         elif cfg.staff_detection_enabled:
             print(
                 "WARNING: Staff uniform detection disabled: "

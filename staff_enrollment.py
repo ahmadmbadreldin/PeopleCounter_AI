@@ -111,7 +111,10 @@ def enroll(employee_id):
                     last_capture = now
                     accepted = True
                     crop = chest_crop(frame, face_box)
-                    if crop is not None and len(uniform_samples) < 12:
+                    # The real black logo exists only on the front chest.
+                    # Side/back samples would teach the uniform matcher the
+                    # wrong appearance, so keep FRONT chest references only.
+                    if crop is not None and pose == "FRONT" and len(uniform_samples) < 12:
                         uniform_samples.append(crop)
 
             if face_box:

@@ -67,7 +67,9 @@ requires a saved, calibrated configuration with a camera password.
 ## Hybrid staff filtering and enrollment
 
 Staff filtering combines per-branch face recognition with the actual white
-shirt/chest-logo appearance captured during enrollment. OpenCV YuNet detects
+formal button-shirt and black front-chest logo captured during enrollment.
+The logo is not expected on the back, so only FRONT chest samples become
+uniform references; side views are retained for face enrollment only. OpenCV YuNet detects
 faces and SFace creates normalized embeddings. Raw face images are not stored;
 the employee code and embeddings are saved in:
 
