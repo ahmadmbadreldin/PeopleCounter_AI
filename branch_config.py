@@ -76,9 +76,23 @@ DEFAULT_CONFIG = {
         "min_positive_frames": 2,
         "process_every_n_frames": 2,
     },
-    "logging": {
-        "file": "logs/default_branch_store_log.xlsx",
-        "queue_size": 100,
+    "storage": {
+        "database": "data/default_branch.sqlite3",
+        "reports_dir": "reports/default_branch",
+        "event_retention_days": 90,
+        "report_retention_days": 365,
+        "report_refresh_delay_s": 2.0,
+        "state_snapshot_interval_s": 10,
+    },
+    "runtime": {
+        "heartbeat_file": "runtime/default_branch_heartbeat.json",
+        "heartbeat_interval_s": 5,
+        "watchdog_stale_s": 45,
+        "watchdog_startup_grace_s": 150,
+        "restart_delay_s": 5,
+        "log_file": "logs/default_branch_runtime.log",
+        "log_max_bytes": 5242880,
+        "log_backup_count": 5,
     },
     "display": {
         "width": 1100,
@@ -124,7 +138,19 @@ def load_branch_config(path=ACTIVE_CONFIG_PATH):
             loaded = json.load(handle)
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"Unable to load branch config '{path}': {exc}") from exc
-    return _deep_merge(DEFAULT_CONFIG, loaded)
+    merged = _deep_merge(DEFAULT_CONFIG, loaded)
+    branch_id = safe_branch_id(merged.get("branch_id", "default_branch"))
+    # Upgrade branch files created before SQLite/heartbeat support without
+    # making different branches share the default_branch runtime files.
+    if "database" not in loaded.get("storage", {}):
+        merged["storage"]["database"] = f"data/{branch_id}.sqlite3"
+    if "reports_dir" not in loaded.get("storage", {}):
+        merged["storage"]["reports_dir"] = f"reports/{branch_id}"
+    if "heartbeat_file" not in loaded.get("runtime", {}):
+        merged["runtime"]["heartbeat_file"] = f"runtime/{branch_id}_heartbeat.json"
+    if "log_file" not in loaded.get("runtime", {}):
+        merged["runtime"]["log_file"] = f"logs/{branch_id}_runtime.log"
+    return merged
 
 
 def validate_config(config):
@@ -161,7 +187,10 @@ def save_branch_config(config, active_path=ACTIVE_CONFIG_PATH, branches_dir=BRAN
     config = _deep_merge(DEFAULT_CONFIG, config)
     branch_id = validate_config(config)
     config["branch_id"] = branch_id
-    config["logging"]["file"] = f"logs/{branch_id}_store_log.xlsx"
+    config["storage"]["database"] = f"data/{branch_id}.sqlite3"
+    config["storage"]["reports_dir"] = f"reports/{branch_id}"
+    config["runtime"]["heartbeat_file"] = f"runtime/{branch_id}_heartbeat.json"
+    config["runtime"]["log_file"] = f"logs/{branch_id}_runtime.log"
     config["face"]["profile_file"] = f"branches/{branch_id}/staff_faces.npz"
     config["staff"]["enrollment_reference_dir"] = (
         f"branches/{branch_id}/uniform_refs"
@@ -171,6 +200,9 @@ def save_branch_config(config, active_path=ACTIVE_CONFIG_PATH, branches_dir=BRAN
     branches_dir = Path(branches_dir)
     branches_dir.mkdir(parents=True, exist_ok=True)
     active_path.parent.mkdir(parents=True, exist_ok=True)
+    resolve_project_path(config["storage"]["reports_dir"]).mkdir(
+        parents=True, exist_ok=True
+    )
     branch_path = branches_dir / f"{branch_id}.json"
 
     payload = json.dumps(config, ensure_ascii=False, indent=2) + "\n"

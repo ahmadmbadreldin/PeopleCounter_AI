@@ -13,7 +13,7 @@ import socket
 import threading
 from dataclasses import dataclass
 from collections import deque
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from queue import Queue, Empty
 from urllib.parse import quote
@@ -26,6 +26,8 @@ from scipy.optimize import linear_sum_assignment
 from staff_face import StaffFaceRecognizer
 from staff_uniform import StaffUniformDetector
 from branch_config import load_branch_config, resolve_project_path, validate_config
+from runtime_logging import configure_rotating_logger
+from runtime_storage import HeartbeatWriter, SQLiteStore
 
 
 # Configure FFmpeg RTSP socket timeout options globally before video capture opens
@@ -128,11 +130,30 @@ class Config:
     crossing_cooldown_s: float = float(_setting("counting", "crossing_cooldown_s", 0.75))
     inside_timeout_s: float = 600.0  # legacy, unused
 
-    # ---------- Logging ----------
-    log_file: str = str(resolve_project_path(
-        _setting("logging", "file", "logs/default_branch_store_log.xlsx")
+    # ---------- Durable storage and unattended runtime ----------
+    database_file: str = str(resolve_project_path(
+        _setting("storage", "database", "data/default_branch.sqlite3")
     ))
-    log_queue_size: int = int(_setting("logging", "queue_size", 100))
+    reports_dir: str = str(resolve_project_path(
+        _setting("storage", "reports_dir", "reports/default_branch")
+    ))
+    event_retention_days: int = int(_setting("storage", "event_retention_days", 90))
+    report_retention_days: int = int(_setting("storage", "report_retention_days", 365))
+    report_refresh_delay_s: float = float(
+        _setting("storage", "report_refresh_delay_s", 2.0)
+    )
+    state_snapshot_interval_s: float = float(
+        _setting("storage", "state_snapshot_interval_s", 10)
+    )
+    heartbeat_file: str = str(resolve_project_path(
+        _setting("runtime", "heartbeat_file", "runtime/default_branch_heartbeat.json")
+    ))
+    heartbeat_interval_s: float = float(_setting("runtime", "heartbeat_interval_s", 5))
+    runtime_log_file: str = str(resolve_project_path(
+        _setting("runtime", "log_file", "logs/default_branch_runtime.log")
+    ))
+    log_max_bytes: int = int(_setting("runtime", "log_max_bytes", 5_242_880))
+    log_backup_count: int = int(_setting("runtime", "log_backup_count", 5))
 
     # ---------- UI ----------
     display_width: int = int(_setting("display", "width", 1100))
@@ -145,6 +166,12 @@ class Config:
 
 
 CONFIG = Config()
+LOGGER = configure_rotating_logger(
+    "people_counter",
+    CONFIG.runtime_log_file,
+    CONFIG.log_max_bytes,
+    CONFIG.log_backup_count,
+)
 
 
 def build_rtsp_url(cfg: Config) -> str:
@@ -180,133 +207,6 @@ def get_local_ip() -> str:
 
 
 LOCAL_IP = get_local_ip()
-
-
-# ============================================================
-# 3. ASYNCHRONOUS EXCEL LOGGER
-# ============================================================
-
-class ExcelLogger:
-    def __init__(self, filename: str, camera_ip: str, queue_size: int = 100):
-        self.filename = Path(filename)
-        self.camera_ip = camera_ip
-        self.queue = Queue(maxsize=queue_size)
-        self.stop_event = threading.Event()
-        self.worker = None
-        self.enabled = False
-        self._lock = threading.Lock()
-
-        try:
-            import openpyxl  # noqa: F401
-            self.enabled = True
-        except ImportError:
-            print("⚠️ openpyxl not installed; Excel logging disabled.")
-            return
-
-        self.filename.parent.mkdir(parents=True, exist_ok=True)
-        self._ensure_workbook()
-        self.worker = threading.Thread(
-            target=self._worker_loop,
-            name="ExcelLogger",
-            daemon=True,
-        )
-        self.worker.start()
-        print(f"📊 Excel logging enabled: {self.filename}")
-
-    def _ensure_workbook(self) -> None:
-        from openpyxl import Workbook
-        if self.filename.exists():
-            return
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Events"
-        ws.append([
-            "Camera_IP", "Date", "Time", "Track_ID", "Event",
-            "Entered_Count", "Exited_Count", "Inside_Count",
-        ])
-        with self._lock:
-            wb.save(self.filename)
-        wb.close()
-
-    def add_event(self, track_id: int, event: str,
-                  entered: int, exited: int, inside: int) -> None:
-        if not self.enabled:
-            return
-        row = (
-            self.camera_ip,
-            datetime.now().strftime("%Y-%m-%d"),
-            datetime.now().strftime("%H:%M:%S"),
-            int(track_id),
-            event,
-            int(entered),
-            int(exited),
-            int(inside),
-        )
-        try:
-            self.queue.put_nowait(row)
-        except Exception:
-            pass
-
-    def _append_rows(self, rows) -> None:
-        from openpyxl import load_workbook
-        with self._lock:
-            wb = load_workbook(self.filename)
-            ws = wb["Events"]
-            for row in rows:
-                ws.append(row)
-            wb.save(self.filename)
-            wb.close()
-
-    def _worker_loop(self) -> None:
-        pending = []
-        last_flush = time.monotonic()
-        while not self.stop_event.is_set() or not self.queue.empty():
-            try:
-                row = self.queue.get(timeout=0.25)
-                pending.append(row)
-                self.queue.task_done()
-            except Empty:
-                pass
-
-            now = time.monotonic()
-            if pending and (len(pending) >= 10 or now - last_flush >= 2.0):
-                try:
-                    self._append_rows(pending)
-                    pending.clear()
-                    last_flush = now
-                except Exception as exc:
-                    if len(pending) > 500:
-                        pending = pending[-250:]
-                    time.sleep(1.0)
-        if pending:
-            try:
-                self._append_rows(pending)
-            except Exception:
-                pass
-
-    def close(self) -> None:
-        if not self.enabled:
-            return
-        self.stop_event.set()
-        if self.worker is not None:
-            self.worker.join(timeout=5.0)
-
-    def show_report(self) -> None:
-        if not self.enabled or not self.filename.exists():
-            return
-        try:
-            import pandas as pd
-            with self._lock:
-                df = pd.read_excel(self.filename, engine="openpyxl")
-            print("\n" + "=" * 70)
-            print("📊 EXCEL REPORT")
-            print(f"Total records: {len(df)}")
-            if not df.empty:
-                print("\nLast 5 records:")
-                print(df.tail(5).to_string(index=False))
-            print("=" * 70)
-        except Exception:
-            pass
 
 
 # ============================================================
@@ -608,6 +508,45 @@ class CameraThread(threading.Thread):
         self.frame = None
         self.sequence = 0
         self.connected = False
+        self._connection_state_known = False
+        self._disconnected_since_monotonic = None
+        self.last_frame_monotonic = None
+        self.connection_events = Queue(maxsize=100)
+
+    def _set_connected(self, connected, reason=""):
+        connected = bool(connected)
+        if self._connection_state_known and connected == self.connected:
+            return
+        now_mono = time.monotonic()
+        downtime_seconds = None
+        if connected:
+            if self._disconnected_since_monotonic is not None:
+                downtime_seconds = round(
+                    max(0.0, now_mono - self._disconnected_since_monotonic), 2
+                )
+            self._disconnected_since_monotonic = None
+        else:
+            self._disconnected_since_monotonic = now_mono
+        self.connected = connected
+        self._connection_state_known = True
+        event = {
+            "connected": connected,
+            "reason": str(reason),
+            "downtime_seconds": downtime_seconds,
+            "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+        try:
+            self.connection_events.put_nowait(event)
+        except Exception:
+            pass
+
+    def drain_connection_events(self):
+        events = []
+        while True:
+            try:
+                events.append(self.connection_events.get_nowait())
+            except Empty:
+                return events
 
     def get_frame(self, last_sequence=-1):
         with self.lock:
@@ -634,14 +573,14 @@ class CameraThread(threading.Thread):
                     if cap is not None: cap.release()
                     cap = self._open()
                     if not cap.isOpened():
-                        self.connected = False
+                        self._set_connected(False, "RTSP open failed")
                         time.sleep(self.cfg.reconnect_delay_s)
                         continue
-                    self.connected = True
+                    self._set_connected(True, "RTSP stream opened")
 
                 ret, frame = cap.read()
                 if not ret or frame is None:
-                    self.connected = False
+                    self._set_connected(False, "Camera frame read failed")
                     cap.release()
                     cap = None
                     time.sleep(self.cfg.reconnect_delay_s)
@@ -650,14 +589,15 @@ class CameraThread(threading.Thread):
                 with self.lock:
                     self.frame = frame
                     self.sequence += 1
+                    self.last_frame_monotonic = time.monotonic()
 
-            except Exception:
-                self.connected = False
+            except Exception as exc:
+                self._set_connected(False, f"Camera exception: {exc}")
                 if cap is not None: cap.release()
                 cap = None
                 time.sleep(self.cfg.reconnect_delay_s)
 
-        self.connected = False
+        self._set_connected(False, "Camera thread stopped")
         if cap is not None:
             cap.release()
 
@@ -670,12 +610,14 @@ class CameraThread(threading.Thread):
 # ============================================================
 
 class StoreCounter:
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, storage: SQLiteStore):
         self.cfg = cfg
+        self.storage = storage
+        self.business_date = date.today().isoformat()
 
-        print("🔄 Loading YOLO model...")
+        print("Loading YOLO model...")
         self.model = YOLO(cfg.model_path)
-        print("✅ YOLO model loaded")
+        print("YOLO model loaded")
 
         self.tracker = IoUTracker(
             max_age=cfg.max_age,
@@ -727,13 +669,14 @@ class StoreCounter:
                 f"{self.face_recognizer.load_error or cfg.face_profile_file}"
             )
 
-        self.total_in = 0
-        self.total_out = 0
+        restored = self.storage.prepare_business_day(self.business_date)
+        self.total_in = restored["total_in"]
+        self.total_out = restored["total_out"]
         self.inside_ids = set()
         self.inside_timestamps = {}  # legacy; occupancy no longer expires
-        self.peak_inside = 0
-        self.staff_ignored = 0
-        self.unknown_crossings = 0
+        self.peak_inside = restored["peak_inside"]
+        self.staff_ignored = restored["staff_ignored"]
+        self.unknown_crossings = restored["unknown_crossings"]
         self.pending_crossings = []
 
         self.zone = (cfg.zone_x1, cfg.zone_y1, cfg.zone_x2, cfg.zone_y2)
@@ -741,15 +684,24 @@ class StoreCounter:
         self.line_hysteresis = cfg.line_hysteresis
 
         self.track_colors = {}
-        self.ignored_small_track_ids = set()
 
         self.frame_counter = 0
         self.fps = 0.0
         self._fps_timer = time.monotonic()
         self._fps_frames = 0
         self.last_sound_time = 0.0
+        self._last_state_save = time.monotonic()
+        self._model_error_count = 0
+        self._model_error_active = False
 
-        self.excel_logger = ExcelLogger(cfg.log_file, cfg.camera_ip, cfg.log_queue_size)
+        LOGGER.info(
+            "Counter restored for %s: IN=%s OUT=%s STAFF=%s UNKNOWN=%s",
+            self.business_date,
+            self.total_in,
+            self.total_out,
+            self.staff_ignored,
+            self.unknown_crossings,
+        )
 
     def scaled_geometry(self, width, height):
         sx = width / self.cfg.base_width
@@ -785,7 +737,34 @@ class StoreCounter:
         if self.cfg.device:
             kwargs["device"] = self.cfg.device
 
-        results = self.model(frame, **kwargs)
+        try:
+            results = self.model(frame, **kwargs)
+        except Exception as exc:
+            self._model_error_count += 1
+            if self._model_error_count == 1 or self._model_error_count % 10 == 0:
+                LOGGER.exception(
+                    "YOLO inference failed (%s consecutive failures)",
+                    self._model_error_count,
+                )
+                self.storage.log_health(
+                    "YOLO_ERROR",
+                    f"consecutive={self._model_error_count}; {type(exc).__name__}: {exc}",
+                    self.business_date,
+                )
+            self._model_error_active = True
+            if self._model_error_count >= 30:
+                raise RuntimeError("YOLO failed 30 consecutive times") from exc
+            return []
+
+        if self._model_error_active:
+            self.storage.log_health(
+                "YOLO_RECOVERED",
+                f"Recovered after {self._model_error_count} consecutive error(s)",
+                self.business_date,
+            )
+            LOGGER.info("YOLO recovered after %s error(s)", self._model_error_count)
+        self._model_error_count = 0
+        self._model_error_active = False
         detections = []
 
         if not results or results[0].boxes is None:
@@ -802,6 +781,7 @@ class StoreCounter:
         return detections
 
     def process_frame(self, frame):
+        self.maybe_roll_business_day()
         height, width = frame.shape[:2]
         zone, line_y, hysteresis = self.scaled_geometry(width, height)
         self.zone = zone
@@ -823,14 +803,19 @@ class StoreCounter:
         active_track_ids = {t.track_id for t in tracks}
 
         for tid in list(self.track_colors.keys()):
-            if tid not in active_track_ids and tid not in self.inside_ids:
+            if tid not in active_track_ids:
                 del self.track_colors[tid]
+        # Tracker IDs cannot survive a process restart and are not the source
+        # of truth for occupancy, so expired IDs must not accumulate forever.
+        self.inside_ids.intersection_update(active_track_ids)
+        for tid in list(self.inside_timestamps):
+            if tid not in active_track_ids:
+                del self.inside_timestamps[tid]
 
         # Build a track-level staff decision from multiple real observations.
         # This is intentionally done before crossing events are resolved.
         for track in tracks:
             if not self.is_valid_object(track):
-                self.ignored_small_track_ids.add(track.track_id)
                 continue
             evidence = self.staff_detector.analyze(frame, track.last_observed_bbox)
             track.uniform_status = self.staff_detector.update_track(track, evidence)
@@ -873,6 +858,10 @@ class StoreCounter:
         # If a tracker ID expires inside the shop, the person remains inside.
         current_inside = max(0, self.total_in - self.total_out)
         self.peak_inside = max(self.peak_inside, current_inside)
+
+        if now_mono - self._last_state_save >= self.cfg.state_snapshot_interval_s:
+            self.storage.save_state(self.state_snapshot())
+            self._last_state_save = now_mono
 
         return self.draw(frame, tracks, zone, line_y, hysteresis, current_inside)
 
@@ -970,13 +959,7 @@ class StoreCounter:
         self._log_event(track.track_id, log_event)
 
     def _log_event(self, track_id, event, play_alert=True):
-        self.excel_logger.add_event(
-            track_id=track_id,
-            event=event,
-            entered=self.total_in,
-            exited=self.total_out,
-            inside=max(0, self.total_in - self.total_out),
-        )
+        self.storage.add_event(track_id, event, self.state_snapshot())
 
         now = time.monotonic()
         if play_alert and now - self.last_sound_time >= self.cfg.sound_cooldown_s:
@@ -984,7 +967,7 @@ class StoreCounter:
             self.last_sound_time = now
 
         print(
-            f"🚶 Track {track_id} {event} | "
+            f"Track {track_id} {event} | "
             f"IN={self.total_in} OUT={self.total_out} "
             f"INSIDE={max(0, self.total_in - self.total_out)}"
         )
@@ -1085,9 +1068,48 @@ class StoreCounter:
         self.inside_timestamps.clear()
         self.track_colors.clear()
         self.tracker.reset()
+        self.storage.save_state(self.state_snapshot())
+
+    def state_snapshot(self):
+        return {
+            "business_date": self.business_date,
+            "total_in": int(self.total_in),
+            "total_out": int(self.total_out),
+            "staff_ignored": int(self.staff_ignored),
+            "unknown_crossings": int(self.unknown_crossings),
+            "peak_inside": int(self.peak_inside),
+        }
+
+    def maybe_roll_business_day(self):
+        today = date.today().isoformat()
+        if today == self.business_date:
+            return False
+        previous = self.business_date
+        self.storage.save_state(self.state_snapshot())
+        self.storage.export_daily_excel(previous)
+        self.business_date = today
+        self.total_in = 0
+        self.total_out = 0
+        self.peak_inside = 0
+        self.staff_ignored = 0
+        self.unknown_crossings = 0
+        self.pending_crossings.clear()
+        self.inside_ids.clear()
+        self.inside_timestamps.clear()
+        self.track_colors.clear()
+        self.tracker.reset()
+        self.storage.save_state(self.state_snapshot())
+        self.storage.log_health("BUSINESS_DAY_STARTED", f"Previous day: {previous}", today)
+        LOGGER.info("Business day rolled over from %s to %s", previous, today)
+        return True
+
+    def export_report(self):
+        report = self.storage.export_daily_excel(self.business_date)
+        LOGGER.info("Daily report exported: %s", report)
+        return report
 
     def close(self):
-        self.excel_logger.close()
+        self.storage.close(self.state_snapshot(), export_today=True)
 
 
 # ============================================================
@@ -1095,31 +1117,92 @@ class StoreCounter:
 # ============================================================
 
 def main():
+    heartbeat = HeartbeatWriter(CONFIG.heartbeat_file)
+    heartbeat.write(
+        status="starting", pid=os.getpid(), branch_id=CONFIG.branch_id,
+        camera_connected=False,
+    )
     try:
         validate_config(_BRANCH_CONFIG)
     except ValueError as exc:
         print(f"Configuration is incomplete: {exc}")
         print("Run setup_branch.py or double-click Start People Counter.cmd.")
-        return
+        LOGGER.error("Configuration is incomplete: %s", exc)
+        heartbeat.write(status="configuration_error", pid=os.getpid(), error=str(exc))
+        return 2
     try:
         camera_url = build_rtsp_url(CONFIG)
     except RuntimeError as exc:
-        print(f"❌ {exc}")
-        return
+        print(f"ERROR: {exc}")
+        LOGGER.error("Unable to build camera URL: %s", exc)
+        heartbeat.write(status="configuration_error", pid=os.getpid(), error=str(exc))
+        return 2
 
-    counter = StoreCounter(CONFIG)
-    camera = CameraThread(camera_url, CONFIG)
-    camera.start()
-
-    cv2.namedWindow(CONFIG.window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(CONFIG.window_name, CONFIG.display_width, CONFIG.display_height)
-
-    process_counter = 0
-    last_processed_frame = None
-    last_sequence = -1
+    storage = SQLiteStore(
+        CONFIG.database_file, CONFIG.branch_id, CONFIG.camera_ip,
+        CONFIG.reports_dir, CONFIG.event_retention_days,
+        CONFIG.report_retention_days, CONFIG.report_refresh_delay_s,
+    )
+    storage.run_maintenance()
+    storage.log_health("PROGRAM_STARTING", f"pid={os.getpid()}")
+    counter = None
+    camera = None
+    exit_code = 0
 
     try:
+        counter = StoreCounter(CONFIG, storage)
+        camera = CameraThread(camera_url, CONFIG)
+        camera.start()
+
+        cv2.namedWindow(CONFIG.window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(CONFIG.window_name, CONFIG.display_width, CONFIG.display_height)
+
+        process_counter = 0
+        last_processed_frame = None
+        last_sequence = -1
+        last_heartbeat = 0.0
+        storage.log_health("PROGRAM_RUNNING", "Model loaded and main loop started")
+        LOGGER.info("People Counter running for branch %s", CONFIG.branch_id)
+
         while True:
+            now_mono = time.monotonic()
+            for connection_event in camera.drain_connection_events():
+                event_name = (
+                    "CAMERA_CONNECTED" if connection_event["connected"]
+                    else "CAMERA_DISCONNECTED"
+                )
+                details = connection_event["reason"]
+                if connection_event.get("downtime_seconds") is not None:
+                    details += (
+                        f"; outage_duration_seconds="
+                        f"{connection_event['downtime_seconds']}"
+                    )
+                storage.log_health(event_name, details)
+                LOGGER.info("%s: %s", event_name, details)
+
+            if now_mono - last_heartbeat >= CONFIG.heartbeat_interval_s:
+                counter.maybe_roll_business_day()
+                last_frame_age = None
+                if camera.last_frame_monotonic is not None:
+                    last_frame_age = round(
+                        max(0.0, now_mono - camera.last_frame_monotonic), 2
+                    )
+                heartbeat.write(
+                    status="running",
+                    pid=os.getpid(),
+                    branch_id=CONFIG.branch_id,
+                    business_date=counter.business_date,
+                    camera_connected=camera.connected,
+                    camera_last_frame_age_s=last_frame_age,
+                    fps=round(counter.fps, 2),
+                    entered=counter.total_in,
+                    exited=counter.total_out,
+                    inside=max(0, counter.total_in - counter.total_out),
+                    staff_ignored=counter.staff_ignored,
+                    unknown_counted=counter.unknown_crossings,
+                )
+                last_heartbeat = now_mono
+
             frame, seq = camera.get_frame(last_sequence)
             if frame is None:
                 cv2.waitKey(1)
@@ -1141,16 +1224,40 @@ def main():
             if key == ord("r"):
                 counter.reset()
             elif key == ord("e"):
-                counter.excel_logger.show_report()
+                report = counter.export_report()
+                print(f"Daily Excel report: {report}")
 
     except KeyboardInterrupt:
-        pass
+        LOGGER.info("Stopped from keyboard")
+    except Exception as exc:
+        exit_code = 1
+        LOGGER.exception("Fatal main-loop error")
+        try:
+            storage.log_health("PROGRAM_CRASH", f"{type(exc).__name__}: {exc}")
+        except Exception:
+            pass
     finally:
-        camera.stop()
-        camera.join(timeout=3.0)
-        counter.close()
+        if camera is not None:
+            camera.stop()
+            camera.join(timeout=3.0)
+        if counter is not None:
+            try:
+                storage.log_health("PROGRAM_STOPPED", f"exit_code={exit_code}")
+                counter.close()
+            except Exception:
+                LOGGER.exception("Failed while closing the counter")
+        else:
+            try:
+                storage.close(export_today=False)
+            except Exception:
+                LOGGER.exception("Failed while closing storage after startup error")
         cv2.destroyAllWindows()
+        heartbeat.write(
+            status="stopped" if exit_code == 0 else "crashed",
+            pid=os.getpid(), branch_id=CONFIG.branch_id, exit_code=exit_code,
+        )
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

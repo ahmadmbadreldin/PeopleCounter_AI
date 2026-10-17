@@ -4,6 +4,9 @@ __pycache__/
 Ultralytics/
 logs/
 branches/
+data/
+reports/
+runtime/
 
 # Contains the local camera password and branch-specific geometry.
 branch_config.json
