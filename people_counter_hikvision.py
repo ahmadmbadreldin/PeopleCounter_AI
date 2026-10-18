@@ -25,8 +25,14 @@ from filterpy.kalman import KalmanFilter
 from scipy.optimize import linear_sum_assignment
 from staff_face import StaffFaceRecognizer
 from staff_uniform import StaffUniformDetector
-from branch_config import load_branch_config, resolve_project_path, validate_config
+from branch_config import (
+    ACTIVE_CONFIG_PATH,
+    load_branch_config,
+    resolve_project_path,
+    validate_config,
+)
 from runtime_logging import configure_rotating_logger
+from runtime_lock import BranchInstanceLock
 from runtime_storage import HeartbeatWriter, SQLiteStore
 
 
@@ -125,6 +131,7 @@ class Config:
     zone_y1: int = int(_setting("counting", "zone_y1", 170))
     zone_x2: int = int(_setting("counting", "zone_x2", 450))
     zone_y2: int = int(_setting("counting", "zone_y2", 260))
+    line_position_ratio: float = float(_setting("counting", "line_position_ratio", 0.50))
     in_direction: str = str(_setting("counting", "in_direction", "top_to_bottom"))
     line_hysteresis: int = int(_setting("counting", "line_hysteresis", 15))
     crossing_cooldown_s: float = float(_setting("counting", "crossing_cooldown_s", 0.75))
@@ -207,6 +214,27 @@ def get_local_ip() -> str:
 
 
 LOCAL_IP = get_local_ip()
+
+
+def display_window_is_open(window_name: str) -> bool:
+    """Allow mouse-only remote sessions to close the OpenCV window with X."""
+    try:
+        return cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) >= 1
+    except cv2.error:
+        return False
+
+
+def counting_signature(config):
+    counting = config.get("counting", {})
+    keys = (
+        "base_width", "base_height", "zone_x1", "zone_y1", "zone_x2",
+        "zone_y2", "line_position_ratio", "in_direction", "line_hysteresis",
+        "crossing_cooldown_s",
+    )
+    return tuple(counting.get(key) for key in keys)
+
+
+CONFIG_RESTART_EXIT_CODE = 75
 
 
 # ============================================================
@@ -339,9 +367,16 @@ class Track:
     def get_size(self):
         return self.detection_width, self.detection_height
 
+    def get_count_point(self):
+        """Bottom-center of the latest real YOLO box (approximate foot point)."""
+        cx, cy, _width, height = self.last_observed_bbox
+        return float(cx), float(cy + height / 2.0)
+
     def update_count_side(self, line_y: float, hysteresis: float, min_stable_frames=2):
         # Never advance the crossing state using predicted-only positions.
-        # Use last observed detection center rather than a Kalman extrapolation.
+        # Use the bottom-center of the latest real detection rather than a
+        # Kalman extrapolation.  This makes the event correspond to the
+        # person's feet crossing the configured doorway line.
         if self.time_since_update != 0:
             return self.count_side, self.count_side
         if self.recovered_after_gap:
@@ -351,7 +386,7 @@ class Track:
             self.candidate_side = None
             self.candidate_frames = 0
             self.recovered_after_gap = False
-        target_y = self.last_observed_bbox[1]
+        _target_x, target_y = self.get_count_point()
         if target_y < line_y - hysteresis:
             new_side = "ABOVE"
         elif target_y > line_y + hysteresis:
@@ -680,7 +715,9 @@ class StoreCounter:
         self.pending_crossings = []
 
         self.zone = (cfg.zone_x1, cfg.zone_y1, cfg.zone_x2, cfg.zone_y2)
-        self.count_line_y = (cfg.zone_y1 + cfg.zone_y2) / 2.0
+        self.count_line_y = cfg.zone_y1 + (
+            (cfg.zone_y2 - cfg.zone_y1) * cfg.line_position_ratio
+        )
         self.line_hysteresis = cfg.line_hysteresis
 
         self.track_colors = {}
@@ -712,9 +749,38 @@ class StoreCounter:
             int(self.cfg.zone_x2 * sx),
             int(self.cfg.zone_y2 * sy),
         )
-        line_y = ((self.cfg.zone_y1 + self.cfg.zone_y2) / 2.0) * sy
+        base_line_y = self.cfg.zone_y1 + (
+            (self.cfg.zone_y2 - self.cfg.zone_y1) * self.cfg.line_position_ratio
+        )
+        line_y = base_line_y * sy
         hysteresis = self.cfg.line_hysteresis * sy
         return zone, line_y, hysteresis
+
+    def apply_counting_config(self, counting):
+        """Apply a newly saved doorway without resetting persisted totals."""
+        for key in (
+            "base_width", "base_height", "zone_x1", "zone_y1", "zone_x2",
+            "zone_y2", "line_hysteresis",
+        ):
+            setattr(self.cfg, key, int(counting[key]))
+        self.cfg.in_direction = str(counting["in_direction"])
+        self.cfg.line_position_ratio = float(counting.get("line_position_ratio", 0.50))
+        self.cfg.crossing_cooldown_s = float(counting["crossing_cooldown_s"])
+        self.zone = (
+            self.cfg.zone_x1, self.cfg.zone_y1,
+            self.cfg.zone_x2, self.cfg.zone_y2,
+        )
+        self.count_line_y = self.cfg.zone_y1 + (
+            (self.cfg.zone_y2 - self.cfg.zone_y1) * self.cfg.line_position_ratio
+        )
+        self.line_hysteresis = self.cfg.line_hysteresis
+        # Old track-side history belongs to the old line and could fabricate a
+        # crossing immediately after calibration changes.
+        self.pending_crossings.clear()
+        self.inside_ids.clear()
+        self.inside_timestamps.clear()
+        self.track_colors.clear()
+        self.tracker.reset()
 
     def get_color(self, track_id):
         if track_id not in self.track_colors:
@@ -835,10 +901,10 @@ class StoreCounter:
         for track in tracks:
             if not self.is_valid_object(track):
                 continue
-            # Count only observed tracks whose detected center intersects the
+            # Count only observed tracks whose foot point intersects the
             # configured horizontal segment, not people outside the entrance.
-            cx = track.last_observed_bbox[0]
-            if not (zone[0] <= cx <= zone[2]):
+            foot_x, _foot_y = track.get_count_point()
+            if not (zone[0] <= foot_x <= zone[2]):
                 continue
             event = track.check_crossing(
                 line_y,
@@ -1009,8 +1075,9 @@ class StoreCounter:
             thickness = 1 if small else 2
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
             
-            # VISUAL FIX: Draw a red dot exactly where the counter is measuring
-            cv2.circle(frame, (int(x), int(y)), 5, (0, 0, 255), -1)
+            # The red dot is the exact bottom-center point used for counting.
+            foot_x, foot_y = track.get_count_point()
+            cv2.circle(frame, (int(foot_x), int(foot_y)), 7, (0, 0, 255), -1)
 
             side = track.count_side or "?"
             label = f"ID:{track.track_id} {side}"
@@ -1086,7 +1153,7 @@ class StoreCounter:
             return False
         previous = self.business_date
         self.storage.save_state(self.state_snapshot())
-        self.storage.export_daily_excel(previous)
+        self.storage.export_monthly_excel(previous[:7])
         self.business_date = today
         self.total_in = 0
         self.total_out = 0
@@ -1104,8 +1171,8 @@ class StoreCounter:
         return True
 
     def export_report(self):
-        report = self.storage.export_daily_excel(self.business_date)
-        LOGGER.info("Daily report exported: %s", report)
+        report = self.storage.export_monthly_excel(self.business_date[:7])
+        LOGGER.info("Monthly report exported: %s", report)
         return report
 
     def close(self):
@@ -1138,6 +1205,14 @@ def main():
         heartbeat.write(status="configuration_error", pid=os.getpid(), error=str(exc))
         return 2
 
+    instance_lock = BranchInstanceLock(CONFIG.branch_id)
+    if not instance_lock.acquired:
+        LOGGER.warning("Another counter instance is already running for %s", CONFIG.branch_id)
+        heartbeat.write(
+            status="already_running", pid=os.getpid(), branch_id=CONFIG.branch_id
+        )
+        return 4
+
     storage = SQLiteStore(
         CONFIG.database_file, CONFIG.branch_id, CONFIG.camera_ip,
         CONFIG.reports_dir, CONFIG.event_retention_days,
@@ -1161,10 +1236,14 @@ def main():
         last_processed_frame = None
         last_sequence = -1
         last_heartbeat = 0.0
+        active_counting_signature = counting_signature(_BRANCH_CONFIG)
         storage.log_health("PROGRAM_RUNNING", "Model loaded and main loop started")
         LOGGER.info("People Counter running for branch %s", CONFIG.branch_id)
 
         while True:
+            if not display_window_is_open(CONFIG.window_name):
+                LOGGER.info("Display window was closed")
+                break
             now_mono = time.monotonic()
             for connection_event in camera.drain_connection_events():
                 event_name = (
@@ -1182,6 +1261,39 @@ def main():
 
             if now_mono - last_heartbeat >= CONFIG.heartbeat_interval_s:
                 counter.maybe_roll_business_day()
+                try:
+                    # Read the small JSON file on every heartbeat.  Comparing only
+                    # its mtime proved unreliable when a remote PC replaced the
+                    # file quickly or synced an older timestamp.
+                    refreshed = load_branch_config(ACTIVE_CONFIG_PATH)
+                    validate_config(refreshed)
+                    if refreshed.get("branch_id") != CONFIG.branch_id:
+                        storage.log_health(
+                            "ACTIVE_BRANCH_CHANGED",
+                            f"from={CONFIG.branch_id}; to={refreshed.get('branch_id')}",
+                        )
+                        LOGGER.info(
+                            "Active branch changed from %s to %s; restarting",
+                            CONFIG.branch_id,
+                            refreshed.get("branch_id"),
+                        )
+                        exit_code = CONFIG_RESTART_EXIT_CODE
+                        break
+                    new_signature = counting_signature(refreshed)
+                    if new_signature != active_counting_signature:
+                        counter.apply_counting_config(refreshed["counting"])
+                        active_counting_signature = new_signature
+                        storage.log_health(
+                            "COUNTING_ZONE_RELOADED",
+                            f"zone={counter.zone}; direction={counter.cfg.in_direction}",
+                        )
+                        LOGGER.info(
+                            "Reloaded counting zone %s direction=%s",
+                            counter.zone,
+                            counter.cfg.in_direction,
+                        )
+                except (OSError, ValueError, RuntimeError) as exc:
+                    LOGGER.error("Unable to reload saved counting config: %s", exc)
                 last_frame_age = None
                 if camera.last_frame_monotonic is not None:
                     last_frame_age = round(
@@ -1225,7 +1337,7 @@ def main():
                 counter.reset()
             elif key == ord("e"):
                 report = counter.export_report()
-                print(f"Daily Excel report: {report}")
+                print(f"Monthly Excel report: {report}")
 
     except KeyboardInterrupt:
         LOGGER.info("Stopped from keyboard")
@@ -1256,6 +1368,7 @@ def main():
             status="stopped" if exit_code == 0 else "crashed",
             pid=os.getpid(), branch_id=CONFIG.branch_id, exit_code=exit_code,
         )
+        instance_lock.close()
     return exit_code
 
 

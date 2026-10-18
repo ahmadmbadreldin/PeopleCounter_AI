@@ -19,7 +19,13 @@ opens the branch setup screen. In that screen:
    and stream (`101` is normally the clearer main stream; `102` is lighter).
 2. Click **Test Connection**.
 3. When the camera preview appears, drag a rectangle around the physical
-   entrance. The green line at its center is the crossing line.
+   entrance. A dashed orange rectangle is the previously saved entrance; the
+   new mouse selection is solid cyan. The green line is the crossing line.
+   Use the **Counting line** slider to move that line anywhere
+   from 10% to 90% of the rectangle height; it does not have to remain in the
+   middle. The new coordinates are committed continuously while
+   dragging so remote-control tools do not have to deliver a final mouse-up
+   event reliably.
 4. Select whether entering moves from top to bottom or bottom to top in the
    image.
 5. With the employee's consent, click **Enroll Staff**, enter the employee
@@ -33,9 +39,22 @@ existing branch later. `branch_config.json` contains the local camera password
 in plain text for this demo: keep the computer and project folder private and
 never commit or share that file.
 
+Saving a new entrance rectangle is detected by the running counter within the
+heartbeat interval (normally five seconds). Track-side history is cleared so
+the moved line cannot create a false crossing, while daily totals remain
+unchanged. A per-branch process lock prevents an older and newer counter from
+counting simultaneously.
+
 To start the already-active `branch_config.json` without changing it, use
 **Start Active Config** in the setup screen. To switch branches, load the
 saved branch and click **Save & Start**, which makes it active.
+
+If an old yellow counting rectangle remains after saving a new cyan rectangle,
+double-click `Stop Old People Counter.cmd`. It stops the scheduled watchdog and
+only the Python processes belonging to this project; unrelated Python programs
+are left running. Then run `Start People Counter.cmd`, test the connection,
+redraw the doorway, and click **Save & Start**. The scheduled task remains
+installed and will run again at the next Windows sign-in.
 
 ## Manual developer setup
 
@@ -68,7 +87,7 @@ not prevent a normal nightly shutdown. The counter starts again after the next
 morning's Windows sign-in. The monitor may turn off without stopping counting.
 
 `watchdog.py` restarts the process after a crash, or after its heartbeat stops
-updating. Closing the counter normally with `Q` or `Esc` also closes the
+updating. Closing the counter normally with `Q`, `Esc`, or the window `X` also closes the
 watchdog; use `Run People Counter 24-7.cmd` to start it again. Only one watchdog
 instance is permitted per branch.
 
@@ -84,27 +103,35 @@ Options.
   `data/<branch_id>.sqlite3` using SQLite WAL mode.
 - A same-day program restart restores `IN`, `OUT`, staff ignored, unknown, and
   peak values. A new calendar day starts at zero.
-- Daily workbooks are generated in `reports/<branch_id>/YYYY-MM-DD.xlsx`; the
-  current day's workbook refreshes automatically shortly after every count or
-  health event. Excel remains a report format, not the live database. Press
-  `E` to force an immediate refresh. Reports are also refreshed on normal
-  shutdown and day rollover.
+- One monthly workbook is generated at
+  `reports/<branch_id>/YYYY-MM.xlsx`. It contains one sheet named
+  `Monthly Summary`, with one row per calendar day. The current day's row is
+  refreshed shortly after every count or health event and at least once per
+  minute while the program is running. The top of the sheet contains monthly
+  totals for IN, OUT, highest occupancy, staff ignored, unknown counted,
+  camera downtime, and program uptime. Excel remains a report format, not the
+  live database. Press `E` to force an immediate refresh. Reports are also
+  refreshed on normal shutdown and day rollover.
 - `runtime/<branch_id>_heartbeat.json` is updated every few seconds with program,
   camera, FPS, and counter status.
 - Camera disconnect/reconnect periods and program/model errors are recorded in
-  SQLite and included in the report's `Health` sheet.
+  SQLite; camera downtime and program uptime are summarized in the monthly
+  workbook.
 - Runtime logs rotate at 5 MB with five backup files. SQLite events default to
   90-day retention and reports to 365 days; these values are configurable in
   `branch_config.json`.
 
 ## Counting behavior
 
+- The red point is the bottom-center of the latest real YOLO person box, an
+  approximation of the person's foot position. A crossing is based on this
+  point passing the green line, not on the center of the torso.
 - A predicted-only Kalman position cannot create an IN/OUT event.
 - A track reacquired after missed observations has its side state reset; the
   unseen path is not guessed.
 - Two observed positions are required on the new side of the line to reduce
   boundary jitter.
-- Only crossings whose person center is within the selected entrance width are
+- Only crossings whose red foot point is within the selected entrance width are
   considered.
 - The visual setup chooses which crossing direction means `IN`.
 - `INSIDE` is `max(0, IN - OUT)`. It is an estimate, not proof of physical

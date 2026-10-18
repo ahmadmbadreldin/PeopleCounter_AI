@@ -91,7 +91,7 @@ def check_storage_round_trip():
         state = empty_state()
         state.update(total_in=1, peak_inside=1)
         store.add_event(1, "IN", state)
-        report = store.export_daily_excel(state["business_date"])
+        report = store.export_monthly_excel(state["business_date"][:7])
         store.close(state, export_today=False)
         if not report.is_file() or report.stat().st_size == 0:
             raise RuntimeError("Excel report was not created")

@@ -53,20 +53,37 @@ class ExcelAndDatabaseTests(unittest.TestCase):
         self.assertEqual(event["inside"], 1)
         self.assertEqual(saved["total_in"], 2)
 
-    def test_excel_report_contains_summary_events_and_health(self):
+    def test_monthly_excel_contains_one_live_row_per_day(self):
         state = empty_state("2026-10-17")
         state.update(total_in=3, total_out=1, peak_inside=2)
         self.store.add_event(1, "IN_UNKNOWN_COUNTED", state)
-        self.store.log_health("CAMERA_DISCONNECTED", "cable", "2026-10-17")
-        report = self.store.export_daily_excel("2026-10-17")
+        with self.store._lock:
+            self.store.connection.executemany(
+                """INSERT INTO health_events
+                   (timestamp, business_date, branch_id, event, details)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    ("2026-10-17T09:00:00+02:00", "2026-10-17", "Branch_A", "PROGRAM_RUNNING", ""),
+                    ("2026-10-17T17:00:00+02:00", "2026-10-17", "Branch_A", "PROGRAM_STOPPED", ""),
+                    ("2026-10-17T10:00:00+02:00", "2026-10-17", "Branch_A", "CAMERA_DISCONNECTED", "cable"),
+                    ("2026-10-17T10:05:20+02:00", "2026-10-17", "Branch_A", "CAMERA_CONNECTED", ""),
+                ),
+            )
+            self.store.connection.commit()
+        report = self.store.export_monthly_excel("2026-10")
         workbook = load_workbook(report, read_only=True, data_only=True)
-        self.assertEqual(workbook.sheetnames, ["Summary", "Events", "Health"])
-        summary = dict(workbook["Summary"].iter_rows(values_only=True))
-        self.assertEqual(summary["Entered"], 3)
-        self.assertEqual(summary["Unknown counted as customer"], 1)
-        self.assertEqual(workbook["Events"].max_row, 2)
-        self.assertEqual(workbook["Health"].max_row, 2)
-        workbook.close()
+        try:
+            self.assertEqual(workbook.sheetnames, ["Monthly Summary"])
+            sheet = workbook["Monthly Summary"]
+            rows = {row[0]: row for row in sheet.iter_rows(min_row=10, values_only=True)}
+            day = rows["2026-10-17"]
+            self.assertEqual(day[1:7], (3, 1, 2, 2, 0, 1))
+            self.assertEqual(day[7].total_seconds(), 320)
+            self.assertEqual(sheet["B4"].value, 3)
+            self.assertEqual(sheet["D4"].value, 1)
+            self.assertEqual(sheet["B6"].value.total_seconds(), 8 * 3600)
+        finally:
+            workbook.close()
 
     def test_health_details_are_bounded(self):
         self.store.log_health("ERROR", "x" * 5000, "2026-10-17")
@@ -194,9 +211,19 @@ class InstallationArtifactTests(unittest.TestCase):
             "Run People Counter 24-7.cmd",
             "Check People Counter Status.cmd",
             "Remove Branch Startup.cmd",
+            "Stop Old People Counter.cmd",
         ):
             with self.subTest(name=name):
                 self.assertTrue((root / name).is_file())
+
+    def test_stop_script_is_scoped_to_this_project(self):
+        root = Path(__file__).resolve().parent
+        script = (root / "stop_people_counter.ps1").read_text(encoding="utf-8")
+        self.assertIn("[Regex]::Escape($projectRoot", script)
+        self.assertIn("people_counter_hikvision.py", script)
+        self.assertIn("watchdog.py", script)
+        self.assertIn("Stop-ScheduledTask", script)
+        self.assertNotIn("Stop-Process -Name python", script)
 
 
 if __name__ == "__main__":

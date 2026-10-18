@@ -6,6 +6,7 @@ from unittest.mock import patch
 import numpy as np
 
 from test_tracking import counter
+from runtime_lock import BranchInstanceLock
 
 
 class FakeStorage:
@@ -24,9 +25,9 @@ class FakeStorage:
     def add_event(self, track_id, event, state):
         self.events.append((track_id, event, dict(state)))
 
-    def export_daily_excel(self, day):
-        self.reports.append(day)
-        return day
+    def export_monthly_excel(self, month):
+        self.reports.append(month)
+        return month
 
 
 class TrackerMathTests(unittest.TestCase):
@@ -84,6 +85,14 @@ class CameraStateTests(unittest.TestCase):
         frame[:] = 0
         self.assertTrue(np.all(camera.frame == 1))
         self.assertEqual(camera.get_frame(3), (None, 3))
+
+    def test_display_window_close_is_detected_without_keyboard(self):
+        with patch.object(counter.cv2, "getWindowProperty", return_value=0):
+            self.assertFalse(counter.display_window_is_open("counter"))
+        with patch.object(counter.cv2, "getWindowProperty", return_value=1):
+            self.assertTrue(counter.display_window_is_open("counter"))
+        with patch.object(counter.cv2, "getWindowProperty", side_effect=counter.cv2.error("closed")):
+            self.assertFalse(counter.display_window_is_open("counter"))
 
 
 class YoloFailureTests(unittest.TestCase):
@@ -179,10 +188,53 @@ class CounterStateTests(unittest.TestCase):
 
         with patch.object(counter, "date", Tomorrow):
             self.assertTrue(store.maybe_roll_business_day())
-        self.assertEqual(store.storage.reports, ["2026-10-17"])
+        self.assertEqual(store.storage.reports, ["2026-10"])
         self.assertEqual(store.business_date, "2026-10-18")
         self.assertEqual(store.total_in, 0)
         self.assertIn("BUSINESS_DAY_STARTED", [item[0] for item in store.storage.health])
+
+    def test_new_doorway_is_applied_without_resetting_totals(self):
+        store = self.make_store()
+        store.cfg.base_width = 1280
+        store.cfg.base_height = 720
+        store.cfg.zone_x1 = 10
+        store.cfg.zone_y1 = 20
+        store.cfg.zone_x2 = 300
+        store.cfg.zone_y2 = 200
+        store.cfg.line_position_ratio = 0.5
+        store.cfg.line_hysteresis = 15
+        store.cfg.in_direction = "top_to_bottom"
+        store.cfg.crossing_cooldown_s = 0.75
+        store.tracker.update([[100, 100, 60, 120]])
+        store.apply_counting_config({
+            "base_width": 640, "base_height": 360,
+            "zone_x1": 200, "zone_y1": 30,
+            "zone_x2": 500, "zone_y2": 300,
+            "line_position_ratio": 0.75,
+            "line_hysteresis": 8,
+            "in_direction": "bottom_to_top",
+            "crossing_cooldown_s": 1.0,
+        })
+        self.assertEqual(store.zone, (200, 30, 500, 300))
+        self.assertEqual(store.cfg.in_direction, "bottom_to_top")
+        self.assertEqual(store.count_line_y, 232.5)
+        self.assertEqual(store.total_in, 4)
+        self.assertEqual(store.tracker.tracks, [])
+
+
+class SingleInstanceTests(unittest.TestCase):
+    def test_only_one_counter_lock_per_branch(self):
+        if counter.os.name != "nt":
+            self.skipTest("Windows named mutex test")
+        branch = f"unit_test_{time.time_ns()}"
+        first = BranchInstanceLock(branch)
+        second = BranchInstanceLock(branch)
+        try:
+            self.assertTrue(first.acquired)
+            self.assertFalse(second.acquired)
+        finally:
+            second.close()
+            first.close()
 
 
 if __name__ == "__main__":

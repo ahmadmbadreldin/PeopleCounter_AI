@@ -39,18 +39,18 @@ class RuntimeStorageTests(unittest.TestCase):
         self.assertEqual(restored["total_out"], 2)
         reopened.close(restored, export_today=False)
 
-    def test_excel_is_generated_as_daily_report(self):
+    def test_excel_is_generated_as_monthly_report(self):
         store = self.make_store()
         state = empty_state("2026-10-17")
         state.update(total_in=1, peak_inside=1)
         store.add_event(1, "IN", state)
         store.log_health("CAMERA_CONNECTED", "test", "2026-10-17")
-        report = store.export_daily_excel("2026-10-17")
+        report = store.export_monthly_excel("2026-10")
         self.assertTrue(report.exists())
-        self.assertEqual(report.name, "2026-10-17.xlsx")
+        self.assertEqual(report.name, "2026-10.xlsx")
         store.close(state, export_today=False)
 
-    def test_daily_excel_refreshes_automatically_after_event(self):
+    def test_monthly_excel_refreshes_current_day_row_after_event(self):
         store = SQLiteStore(
             self.database,
             "test_branch",
@@ -61,11 +61,19 @@ class RuntimeStorageTests(unittest.TestCase):
         state = empty_state()
         state.update(total_in=1, peak_inside=1)
         store.add_event(2, "IN", state)
-        report = self.reports / f"{state['business_date']}.xlsx"
+        report = self.reports / f"{state['business_date'][:7]}.xlsx"
         deadline = time.monotonic() + 4.0
         while not report.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertTrue(report.exists())
+        from openpyxl import load_workbook
+        workbook = load_workbook(report, read_only=True, data_only=True)
+        rows = {
+            row[0]: row
+            for row in workbook["Monthly Summary"].iter_rows(min_row=10, values_only=True)
+        }
+        self.assertEqual(rows[state["business_date"]][1], 1)
+        workbook.close()
         store.close(state, export_today=False)
 
     def test_new_business_day_resets_counters_and_exports_previous_day(self):
@@ -75,7 +83,7 @@ class RuntimeStorageTests(unittest.TestCase):
         store.add_event(9, "OUT", old)
         current = store.prepare_business_day("2026-10-17")
         self.assertEqual(current["total_in"], 0)
-        self.assertTrue((self.reports / "2026-10-16.xlsx").exists())
+        self.assertTrue((self.reports / "2026-10.xlsx").exists())
         store.close(current, export_today=False)
 
 

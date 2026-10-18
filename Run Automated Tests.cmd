@@ -9,7 +9,7 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 
-".venv\Scripts\python.exe" -m py_compile branch_config.py people_counter_hikvision.py runtime_storage.py runtime_logging.py staff_face.py staff_uniform.py staff_enrollment.py setup_branch.py watchdog.py status.py system_check.py
+".venv\Scripts\python.exe" -m py_compile branch_config.py people_counter_hikvision.py runtime_storage.py runtime_logging.py runtime_lock.py staff_face.py staff_uniform.py staff_enrollment.py setup_branch.py watchdog.py status.py system_check.py
 if errorlevel 1 goto :failed
 ".venv\Scripts\python.exe" -m unittest discover -v
 if errorlevel 1 goto :failed

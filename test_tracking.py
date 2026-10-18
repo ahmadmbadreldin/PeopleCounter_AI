@@ -54,14 +54,18 @@ from branch_config import (
 )
 
 class TrackingTests(unittest.TestCase):
-    def new_track(self, y=50):
-        return counter.Track([200, y, 60, 100], 4)
+    def new_track(self, foot_y=50):
+        return counter.Track([200, foot_y - 50, 60, 100], 4)
 
-    def observed(self, track, y):
+    def observed(self, track, foot_y):
         track.predict()
-        track.update([200, y, 60, 100])
+        track.update([200, foot_y - 50, 60, 100])
         self.tick = getattr(self, "tick", 1000) + 1
         return track.check_crossing(100, 10, self.tick, 0.75)
+
+    def test_red_count_point_is_bottom_center_of_detection(self):
+        track = counter.Track([220, 140, 80, 180], 9)
+        self.assertEqual(track.get_count_point(), (220.0, 230.0))
 
     def test_normal_entry_and_exit(self):
         t = self.new_track()
@@ -76,13 +80,13 @@ class TrackingTests(unittest.TestCase):
         t = self.new_track()
         t.check_crossing(100, 10, 1000, 0.75, 'bottom_to_top')
         t.predict()
-        t.update([200, 55, 60, 100])
+        t.update([200, 5, 60, 100])
         t.check_crossing(100, 10, 1001, 0.75, 'bottom_to_top')
         t.predict()
-        t.update([200, 125, 60, 100])
+        t.update([200, 75, 60, 100])
         self.assertIsNone(t.check_crossing(100, 10, 1002, 0.75, 'bottom_to_top'))
         t.predict()
-        t.update([200, 130, 60, 100])
+        t.update([200, 80, 60, 100])
         self.assertEqual(
             t.check_crossing(100, 10, 1003, 0.75, 'bottom_to_top'),
             'OUT',
@@ -103,7 +107,7 @@ class TrackingTests(unittest.TestCase):
         self.observed(t, 55)
         t.predict()
         t.predict()
-        t.update([200, 130, 60, 100])
+        t.update([200, 80, 60, 100])
         self.assertIsNone(t.check_crossing(100, 10, 10, .75))
         self.assertIsNone(self.observed(t, 135))
         self.assertEqual(t.count_side, 'BELOW')

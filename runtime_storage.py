@@ -1,6 +1,7 @@
-"""SQLite state/event storage, daily Excel reports, and atomic heartbeat files."""
+"""SQLite state/event storage, monthly Excel reports, and atomic heartbeat files."""
 
 import json
+import calendar
 import logging
 import os
 import sqlite3
@@ -69,7 +70,7 @@ class SQLiteStore:
         self._export_lock = threading.Lock()
         self._report_thread = threading.Thread(
             target=self._report_loop,
-            name="DailyExcelReport",
+            name="MonthlyExcelReport",
             daemon=True,
         )
         self._report_thread.start()
@@ -145,7 +146,7 @@ class SQLiteStore:
                 self._write_state_locked(state)
                 self.connection.commit()
         if previous_date:
-            self.export_daily_excel(previous_date)
+            self.export_monthly_excel(previous_date[:7])
         self.export_missing_past_reports(today)
         return state
 
@@ -234,25 +235,30 @@ class SQLiteStore:
         self.request_report()
 
     def request_report(self):
-        """Refresh today's workbook soon without blocking video processing."""
+        """Refresh this month's workbook soon without blocking video processing."""
         if not self._closed:
             self._report_requested.set()
 
     def _report_loop(self):
+        last_periodic_refresh = time.monotonic()
         while not self._report_stop.is_set():
-            if not self._report_requested.wait(timeout=1.0):
+            requested = self._report_requested.wait(timeout=1.0)
+            periodic = time.monotonic() - last_periodic_refresh >= 60.0
+            if not requested and not periodic:
                 continue
             if self._report_stop.is_set():
                 break
             # Group events that happen within a short burst into one workbook save.
-            time.sleep(self.report_refresh_delay_s)
+            if requested:
+                time.sleep(self.report_refresh_delay_s)
             if self._report_stop.is_set():
                 break
             self._report_requested.clear()
             try:
-                self.export_daily_excel(date.today().isoformat())
+                self.export_monthly_excel(date.today().strftime("%Y-%m"))
+                last_periodic_refresh = time.monotonic()
             except Exception:
-                LOGGER.exception("Unable to refresh the daily Excel report")
+                LOGGER.exception("Unable to refresh the monthly Excel report")
                 # Excel may temporarily lock the workbook while a user has it
                 # open. Keep SQLite authoritative and retry in the background.
                 self._report_requested.set()
@@ -271,71 +277,178 @@ class SQLiteStore:
                 """,
                 (self.branch_id, today, self.branch_id, today),
             ).fetchall()
-        for row in rows:
-            report = self.reports_dir / f"{row['business_date']}.xlsx"
+        months = sorted({row["business_date"][:7] for row in rows})
+        for month in months:
+            report = self.reports_dir / f"{month}.xlsx"
             if not report.exists():
-                self.export_daily_excel(row["business_date"])
+                self.export_monthly_excel(month)
+
+    def export_monthly_excel(self, report_month=None):
+        with self._export_lock:
+            return self._export_monthly_excel_unlocked(report_month)
 
     def export_daily_excel(self, business_date=None):
-        with self._export_lock:
-            return self._export_daily_excel_unlocked(business_date)
+        """Compatibility wrapper: refresh the month containing this date."""
+        value = business_date or date.today().isoformat()
+        return self.export_monthly_excel(str(value)[:7])
 
-    def _export_daily_excel_unlocked(self, business_date=None):
+    @staticmethod
+    def _duration_seconds(rows, start_event, stop_events, report_day, now):
+        """Sum event-state intervals for one day, including an open interval."""
+        start = None
+        total = 0.0
+        for row in rows:
+            event = row["event"]
+            timestamp = datetime.fromisoformat(row["timestamp"])
+            if event == start_event:
+                if start is None:
+                    start = timestamp
+            elif event in stop_events and start is not None:
+                total += max(0.0, (timestamp - start).total_seconds())
+                start = None
+        if start is not None:
+            if report_day == now.date().isoformat():
+                end = now
+            else:
+                end = start.replace(hour=23, minute=59, second=59)
+            total += max(0.0, (end - start).total_seconds())
+        return int(round(total))
+
+    def _export_monthly_excel_unlocked(self, report_month=None):
         from openpyxl import Workbook
-        from openpyxl.styles import Font
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
 
-        report_date = business_date or date.today().isoformat()
+        month = str(report_month or date.today().strftime("%Y-%m"))[:7]
+        try:
+            year, month_number = (int(part) for part in month.split("-"))
+            first_day = date(year, month_number, 1)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Report month must use YYYY-MM format.") from exc
+        last_day = date(year, month_number, calendar.monthrange(year, month_number)[1])
+        now = datetime.now().astimezone()
+        visible_last_day = min(last_day, now.date()) if first_day <= now.date() else last_day
+        first_text = first_day.isoformat()
+        last_text = last_day.isoformat()
         with self._lock:
             events = self.connection.execute(
-                """SELECT timestamp, camera_ip, track_id, event, entered, exited, inside
-                   FROM events WHERE branch_id = ? AND business_date = ? ORDER BY id""",
-                (self.branch_id, report_date),
+                """SELECT timestamp, business_date, camera_ip, track_id, event, entered, exited, inside
+                   FROM events WHERE branch_id = ? AND business_date BETWEEN ? AND ?
+                   ORDER BY business_date, id""",
+                (self.branch_id, first_text, last_text),
             ).fetchall()
             health = self.connection.execute(
-                """SELECT timestamp, event, details FROM health_events
-                   WHERE branch_id = ? AND business_date = ? ORDER BY id""",
-                (self.branch_id, report_date),
+                """SELECT timestamp, business_date, event, details FROM health_events
+                   WHERE branch_id = ? AND business_date BETWEEN ? AND ?
+                   ORDER BY business_date, id""",
+                (self.branch_id, first_text, last_text),
             ).fetchall()
 
-        final_in = int(events[-1]["entered"]) if events else 0
-        final_out = int(events[-1]["exited"]) if events else 0
-        max_inside = max((int(row["inside"]) for row in events), default=0)
-        staff_ignored = sum("STAFF_" in row["event"] for row in events)
-        unknown_counted = sum("UNKNOWN_COUNTED" in row["event"] for row in events)
+        events_by_day = {}
+        for row in events:
+            day = row["business_date"]
+            events_by_day.setdefault(day, []).append(row)
+        health_by_day = {}
+        for row in health:
+            health_by_day.setdefault(row["business_date"], []).append(row)
+
+        daily_rows = []
+        cursor = first_day
+        while cursor <= visible_last_day:
+            day = cursor.isoformat()
+            day_events = events_by_day.get(day, [])
+            day_health = health_by_day.get(day, [])
+            final_in = int(day_events[-1]["entered"]) if day_events else 0
+            final_out = int(day_events[-1]["exited"]) if day_events else 0
+            peak_inside = max((int(row["inside"]) for row in day_events), default=0)
+            staff_ignored = sum("STAFF_" in row["event"] for row in day_events)
+            unknown_counted = sum("UNKNOWN_COUNTED" in row["event"] for row in day_events)
+            camera_downtime = self._duration_seconds(
+                day_health,
+                "CAMERA_DISCONNECTED",
+                {"CAMERA_CONNECTED", "PROGRAM_STOPPED"},
+                day,
+                now,
+            )
+            program_uptime = self._duration_seconds(
+                day_health,
+                "PROGRAM_RUNNING",
+                {"PROGRAM_STOPPED"},
+                day,
+                now,
+            )
+            daily_rows.append({
+                "date": day,
+                "in": final_in,
+                "out": final_out,
+                "closing_inside": max(0, final_in - final_out),
+                "peak_inside": peak_inside,
+                "staff_ignored": staff_ignored,
+                "unknown_counted": unknown_counted,
+                "camera_downtime": camera_downtime,
+                "program_uptime": program_uptime,
+            })
+            cursor += timedelta(days=1)
 
         wb = Workbook()
         summary = wb.active
-        summary.title = "Summary"
-        summary.append(["Branch", self.branch_id])
-        summary.append(["Date", report_date])
-        summary.append(["Entered", final_in])
-        summary.append(["Exited", final_out])
-        summary.append(["Inside at last event", max(0, final_in - final_out)])
-        summary.append(["Peak inside", max_inside])
-        summary.append(["Staff ignored", staff_ignored])
-        summary.append(["Unknown counted as customer", unknown_counted])
-        for cell in summary[1]:
-            cell.font = Font(bold=True)
+        summary.title = "Monthly Summary"
+        summary.merge_cells("A1:H1")
+        summary["A1"] = "MONTHLY PEOPLE COUNTER REPORT"
+        summary["A1"].font = Font(bold=True, size=16, color="FFFFFF")
+        summary["A1"].fill = PatternFill("solid", fgColor="1F4E78")
+        summary["A1"].alignment = Alignment(horizontal="center")
+        summary["A2"] = "Branch"
+        summary["B2"] = self.branch_id
+        summary["D2"] = "Month"
+        summary["E2"] = month
 
-        ws = wb.create_sheet("Events")
-        ws.append([
-            "Timestamp", "Camera IP", "Track ID", "Event",
-            "Entered", "Exited", "Inside",
-        ])
-        for row in events:
-            ws.append(list(row))
-        for cell in ws[1]:
-            cell.font = Font(bold=True)
+        total_in = sum(row["in"] for row in daily_rows)
+        total_out = sum(row["out"] for row in daily_rows)
+        highest_peak = max((row["peak_inside"] for row in daily_rows), default=0)
+        total_staff = sum(row["staff_ignored"] for row in daily_rows)
+        total_unknown = sum(row["unknown_counted"] for row in daily_rows)
+        total_downtime = sum(row["camera_downtime"] for row in daily_rows)
+        total_uptime = sum(row["program_uptime"] for row in daily_rows)
+        totals = (
+            ("Total IN", total_in, "Total OUT", total_out, "Highest Peak", highest_peak),
+            ("Staff Ignored", total_staff, "Unknown Counted", total_unknown,
+             "Camera Downtime", total_downtime / 86400.0),
+            ("Program Uptime", total_uptime / 86400.0, "", "", "", ""),
+        )
+        for row_index, values in enumerate(totals, start=4):
+            for column, value in enumerate(values, start=1):
+                summary.cell(row=row_index, column=column, value=value)
+        summary["F5"].number_format = "[h]:mm:ss"
+        summary["B6"].number_format = "[h]:mm:ss"
 
-        hs = wb.create_sheet("Health")
-        hs.append(["Timestamp", "Event", "Details"])
-        for row in health:
-            hs.append(list(row))
-        for cell in hs[1]:
-            cell.font = Font(bold=True)
+        header_row = 9
+        headers = (
+            "Date", "IN", "OUT", "Closing Inside", "Peak Inside",
+            "Staff Ignored", "Unknown Counted", "Camera Downtime",
+        )
+        for column, value in enumerate(headers, start=1):
+            cell = summary.cell(row=header_row, column=column, value=value)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="4472C4")
+            cell.alignment = Alignment(horizontal="center")
+        for row_index, item in enumerate(daily_rows, start=header_row + 1):
+            values = (
+                item["date"], item["in"], item["out"], item["closing_inside"],
+                item["peak_inside"], item["staff_ignored"],
+                item["unknown_counted"], item["camera_downtime"] / 86400.0,
+            )
+            for column, value in enumerate(values, start=1):
+                summary.cell(row=row_index, column=column, value=value)
+            summary.cell(row=row_index, column=8).number_format = "[h]:mm:ss"
+        summary.freeze_panes = f"A{header_row + 1}"
+        summary.auto_filter.ref = f"A{header_row}:H{header_row + len(daily_rows)}"
+        widths = (14, 11, 11, 18, 15, 17, 19, 20)
+        for index, width in enumerate(widths, start=1):
+            summary.column_dimensions[get_column_letter(index)].width = width
 
         self.reports_dir.mkdir(parents=True, exist_ok=True)
-        target = self.reports_dir / f"{report_date}.xlsx"
+        target = self.reports_dir / f"{month}.xlsx"
         temporary = target.with_suffix(".tmp.xlsx")
         wb.save(temporary)
         wb.close()
@@ -357,9 +470,10 @@ class SQLiteStore:
             self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
         report_cutoff = date.today() - timedelta(days=self.report_retention_days)
-        for report in self.reports_dir.glob("????-??-??.xlsx"):
+        for report in self.reports_dir.glob("????-??.xlsx"):
             try:
-                if date.fromisoformat(report.stem) < report_cutoff:
+                report_month = date.fromisoformat(f"{report.stem}-01")
+                if report_month < report_cutoff.replace(day=1):
                     report.unlink()
             except (OSError, ValueError):
                 continue
@@ -373,8 +487,8 @@ class SQLiteStore:
         if state is not None:
             self.save_state(state)
         if export_today:
-            self.export_daily_excel(
-                state["business_date"] if state else date.today().isoformat()
+            self.export_monthly_excel(
+                (state["business_date"] if state else date.today().isoformat())[:7]
             )
         with self._lock:
             self.connection.close()

@@ -57,6 +57,8 @@ class BranchSetupApp:
         self.port_var = tk.StringVar()
         self.stream_var = tk.StringVar()
         self.direction_var = tk.StringVar()
+        self.line_position_var = tk.DoubleVar(value=50.0)
+        self.line_position_label_var = tk.StringVar(value="Counting line: 50%")
         self.saved_branch_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Enter camera details, then click Test Connection.")
 
@@ -152,6 +154,18 @@ class BranchSetupApp:
             value="bottom_to_top",
             command=self._draw_direction_arrow,
         ).pack(side="left")
+        ttk.Label(direction, textvariable=self.line_position_label_var).pack(
+            side="left", padx=(35, 6)
+        )
+        ttk.Scale(
+            direction,
+            from_=10,
+            to=90,
+            orient="horizontal",
+            length=180,
+            variable=self.line_position_var,
+            command=self._line_position_changed,
+        ).pack(side="left")
 
         footer = ttk.Frame(outer)
         footer.pack(fill="x", pady=(10, 0))
@@ -187,6 +201,9 @@ class BranchSetupApp:
         self.port_var.set(str(camera.get("rtsp_port", 554)))
         self.stream_var.set(str(camera.get("stream_channel", "101")))
         self.direction_var.set(counting.get("in_direction", "top_to_bottom"))
+        line_percent = float(counting.get("line_position_ratio", 0.50)) * 100.0
+        self.line_position_var.set(line_percent)
+        self.line_position_label_var.set(f"Counting line: {line_percent:.0f}%")
         self.zone_confirmed = bool(counting.get("calibrated", False))
         self.zone_original = (
             int(counting.get("zone_x1", 0)),
@@ -230,6 +247,9 @@ class BranchSetupApp:
             "rtsp_url": "",
         })
         config["counting"]["in_direction"] = self.direction_var.get()
+        config["counting"]["line_position_ratio"] = round(
+            float(self.line_position_var.get()) / 100.0, 4
+        )
         config["counting"]["calibrated"] = bool(self.zone_confirmed)
         if self.frame is not None and self.zone_original is not None:
             height, width = self.frame.shape[:2]
@@ -309,9 +329,15 @@ class BranchSetupApp:
         self.frame = frame
         self._show_frame()
         height, width = frame.shape[:2]
-        self.status_var.set(
-            f"Camera connected: {width}x{height}. Drag a rectangle around the entrance."
-        )
+        if self.zone_confirmed and self.zone_original is not None:
+            self.status_var.set(
+                f"Camera connected: {width}x{height}. The dashed ORANGE rectangle is the "
+                "previous saved entrance; drag a NEW CYAN rectangle to replace it."
+            )
+        else:
+            self.status_var.set(
+                f"Camera connected: {width}x{height}. Drag a rectangle around the entrance."
+            )
 
     def _show_frame(self):
         if self.frame is None:
@@ -342,13 +368,17 @@ class BranchSetupApp:
         self.canvas.create_image(ox, oy, image=self.photo, anchor="nw")
         self._draw_saved_zone()
 
-    def _canvas_to_image(self, x, y):
+    def _canvas_to_image(self, x, y, clamp=False):
         if self.frame is None:
             return None
         ox, oy = self.image_offset
         height, width = self.frame.shape[:2]
         image_x = int(round((x - ox) / self.image_scale))
         image_y = int(round((y - oy) / self.image_scale))
+        if clamp:
+            image_x = min(max(image_x, 0), width - 1)
+            image_y = min(max(image_y, 0), height - 1)
+            return image_x, image_y
         if not (0 <= image_x < width and 0 <= image_y < height):
             return None
         return image_x, image_y
@@ -357,11 +387,32 @@ class BranchSetupApp:
         ox, oy = self.image_offset
         return ox + x * self.image_scale, oy + y * self.image_scale
 
+    def _line_position_changed(self, value):
+        percent = min(90.0, max(10.0, float(value)))
+        self.line_position_label_var.set(f"Counting line: {percent:.0f}%")
+        if self.zone_original is None or self.frame is None:
+            return
+        self.zone_confirmed = True
+        x1, y1, x2, y2 = self.zone_original
+        self._draw_selection((x1, y1), (x2, y2), saved=False)
+        self.status_var.set(
+            f"Counting line moved to {percent:.0f}% of the entrance height; ready to save."
+        )
+
+    def _line_canvas_y(self, y1, y2):
+        ratio = min(0.90, max(0.10, float(self.line_position_var.get()) / 100.0))
+        return y1 + (y2 - y1) * ratio
+
     def _start_selection(self, event):
         point = self._canvas_to_image(event.x, event.y)
         if point is None:
             return
         self.selection_start = point
+        # The next drag is a replacement, not a decoration over the saved
+        # doorway.  Clearing these values prevents Save from silently reusing
+        # the old coordinates if a remote-desktop mouse-release event is lost.
+        self.zone_original = None
+        self.zone_confirmed = False
         if self.zone_canvas_id is not None:
             self.canvas.delete(self.zone_canvas_id)
         if self.line_canvas_id is not None:
@@ -374,44 +425,61 @@ class BranchSetupApp:
         self.line_canvas_id = None
         self.direction_canvas_id = None
         self.direction_text_id = None
+        self.status_var.set("Redrawing entrance: keep dragging to the opposite corner.")
 
     def _move_selection(self, event):
         point = self._canvas_to_image(event.x, event.y)
         if self.selection_start is None or point is None:
             return
         self._draw_selection(self.selection_start, point)
+        # AnyDesk and similar tools can lose ButtonRelease while still sending
+        # motion events.  Commit every valid drag position so the visible cyan
+        # rectangle is always the rectangle that Save & Start will write.
+        self._commit_selection(self.selection_start, point, announce=False)
 
     def _finish_selection(self, event):
-        point = self._canvas_to_image(event.x, event.y)
+        point = self._canvas_to_image(event.x, event.y, clamp=True)
         if self.selection_start is None or point is None:
             self.selection_start = None
             return
-        x1, x2 = sorted((self.selection_start[0], point[0]))
-        y1, y2 = sorted((self.selection_start[1], point[1]))
+        first = self.selection_start
         self.selection_start = None
-        if x2 - x1 < 25 or y2 - y1 < 25:
+        if not self._commit_selection(first, point, announce=True):
             self.status_var.set("The entrance rectangle is too small. Draw it again.")
-            return
+
+    def _commit_selection(self, first, second, announce=False):
+        """Make the visible drag the source of truth, even before mouse-up."""
+        x1, x2 = sorted((first[0], second[0]))
+        y1, y2 = sorted((first[1], second[1]))
+        if x2 - x1 < 25 or y2 - y1 < 25:
+            return False
         self.zone_original = (x1, y1, x2, y2)
         self.zone_confirmed = True
-        self._draw_selection((x1, y1), (x2, y2))
-        self.status_var.set(
-            f"Entrance selected: ({x1}, {y1}) to ({x2}, {y2}). Choose the IN direction."
-        )
+        if announce:
+            self._draw_selection((x1, y1), (x2, y2))
+            self.status_var.set(
+                f"NEW entrance selected and ready to save: "
+                f"({x1}, {y1}) to ({x2}, {y2})."
+            )
+        return True
 
-    def _draw_selection(self, first, second):
+    def _draw_selection(self, first, second, saved=False):
         x1, y1 = self._image_to_canvas(*first)
         x2, y2 = self._image_to_canvas(*second)
+        outline = "#ff9900" if saved else "#00ffff"
+        dash = (8, 4) if saved else ()
+        line_y = self._line_canvas_y(y1, y2)
         if self.zone_canvas_id is None:
             self.zone_canvas_id = self.canvas.create_rectangle(
-                x1, y1, x2, y2, outline="#00ffff", width=3
+                x1, y1, x2, y2, outline=outline, width=3, dash=dash
             )
             self.line_canvas_id = self.canvas.create_line(
-                x1, (y1 + y2) / 2, x2, (y1 + y2) / 2, fill="#00ff00", width=3
+                x1, line_y, x2, line_y, fill="#00ff00", width=3
             )
         else:
             self.canvas.coords(self.zone_canvas_id, x1, y1, x2, y2)
-            self.canvas.coords(self.line_canvas_id, x1, (y1 + y2) / 2, x2, (y1 + y2) / 2)
+            self.canvas.coords(self.line_canvas_id, x1, line_y, x2, line_y)
+            self.canvas.itemconfigure(self.zone_canvas_id, outline=outline, dash=dash)
         self._draw_direction_arrow()
 
     def _draw_direction_arrow(self):
@@ -461,7 +529,7 @@ class BranchSetupApp:
             x1, x2 = int(x1 * width / old_w), int(x2 * width / old_w)
             y1, y2 = int(y1 * height / old_h), int(y2 * height / old_h)
             self.zone_original = (x1, y1, x2, y2)
-        self._draw_selection((x1, y1), (x2, y2))
+        self._draw_selection((x1, y1), (x2, y2), saved=True)
 
     def _save_and_start(self):
         try:

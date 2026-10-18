@@ -34,6 +34,7 @@ DEFAULT_CONFIG = {
         "zone_y1": 170,
         "zone_x2": 450,
         "zone_y2": 260,
+        "line_position_ratio": 0.50,
         "in_direction": "top_to_bottom",
         "line_hysteresis": 15,
         "crossing_cooldown_s": 0.75,
@@ -178,6 +179,9 @@ def validate_config(config):
         raise ValueError("Test the camera and draw the entrance rectangle before saving.")
     if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
         raise ValueError("Draw a valid entrance rectangle on the camera preview.")
+    line_position = float(counting.get("line_position_ratio", 0.50))
+    if not 0.10 <= line_position <= 0.90:
+        raise ValueError("Counting line position must be between 10% and 90%.")
     if counting.get("in_direction") not in ("top_to_bottom", "bottom_to_top"):
         raise ValueError("Select a valid entrance direction.")
     return branch_id

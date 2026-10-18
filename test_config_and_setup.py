@@ -66,6 +66,8 @@ class ConfigValidationTests(unittest.TestCase):
             {"base_width": 0},
             {"zone_x1": 450, "zone_x2": 150},
             {"zone_y2": 9999},
+            {"line_position_ratio": 0.05},
+            {"line_position_ratio": 0.95},
             {"in_direction": "sideways"},
         )
         for update in invalid_updates:
@@ -129,6 +131,23 @@ class SetupGeometryTests(unittest.TestCase):
         self.assertEqual(image_point, (200, 100))
         self.assertEqual(app._image_to_canvas(*image_point), (110.0, 70.0))
         self.assertIsNone(app._canvas_to_image(0, 0))
+        self.assertEqual(app._canvas_to_image(0, 0, clamp=True), (0, 0))
+
+    def test_drag_is_committed_before_mouse_release(self):
+        app = self.make_app()
+        app.zone_original = (10, 10, 20, 20)
+        app.zone_confirmed = False
+        self.assertTrue(app._commit_selection((700, 500), (100, 100)))
+        self.assertEqual(app.zone_original, (100, 100, 700, 500))
+        self.assertTrue(app.zone_confirmed)
+
+    def test_too_small_drag_cannot_reuse_old_zone(self):
+        app = self.make_app()
+        app.zone_original = None
+        app.zone_confirmed = False
+        self.assertFalse(app._commit_selection((100, 100), (110, 110)))
+        self.assertIsNone(app.zone_original)
+        self.assertFalse(app.zone_confirmed)
 
     def test_form_config_copies_camera_and_selected_zone(self):
         app = self.make_app()
@@ -140,6 +159,7 @@ class SetupGeometryTests(unittest.TestCase):
         app.port_var = Value("8554")
         app.stream_var = Value("102")
         app.direction_var = Value("bottom_to_top")
+        app.line_position_var = Value(72.0)
         app.zone_confirmed = True
         app.zone_original = (100, 200, 600, 500)
         result = app._form_config()
@@ -149,6 +169,7 @@ class SetupGeometryTests(unittest.TestCase):
         self.assertEqual(result["counting"]["base_width"], 1280)
         self.assertEqual(result["counting"]["zone_x2"], 600)
         self.assertEqual(result["counting"]["in_direction"], "bottom_to_top")
+        self.assertEqual(result["counting"]["line_position_ratio"], 0.72)
 
 
 if __name__ == "__main__":

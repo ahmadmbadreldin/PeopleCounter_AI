@@ -23,7 +23,7 @@ syntax checks and every `test_*.py` test. The suite currently covers:
 | Camera state | Disconnect/reconnect events and downtime | One event per transition |
 | Counter state | Reset, snapshot, day rollover | Exact persisted values |
 | SQLite | WAL, schema, atomic event/state, restart | No counter loss after reopen |
-| Excel | Sheets, values, automatic refresh | Summary/Events/Health match SQLite |
+| Excel | Monthly row values and automatic refresh | Monthly Summary matches SQLite |
 | Retention | Old DB rows and reports | Removed at configured age |
 | Heartbeat/status | Fresh, stale, missing, corrupt | Correct healthy/unhealthy exit code |
 | Watchdog | Hung child termination | Terminate then kill fallback |
@@ -116,7 +116,7 @@ For the controlled trial, compare four sources:
 1. observer ground truth;
 2. on-screen IN/OUT counters;
 3. SQLite `events` and `counter_state`;
-4. Excel Summary and Events sheets.
+4. The current date row in the Excel `Monthly Summary` sheet.
 
 The screen, SQLite, and Excel must agree exactly. Any difference is a software
 failure even when the camera accuracy itself is acceptable.
