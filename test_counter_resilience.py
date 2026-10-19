@@ -25,9 +25,9 @@ class FakeStorage:
     def add_event(self, track_id, event, state):
         self.events.append((track_id, event, dict(state)))
 
-    def export_monthly_excel(self, month):
-        self.reports.append(month)
-        return month
+    def export_daily_excel(self, day):
+        self.reports.append(day)
+        return day
 
 
 class TrackerMathTests(unittest.TestCase):
@@ -188,7 +188,7 @@ class CounterStateTests(unittest.TestCase):
 
         with patch.object(counter, "date", Tomorrow):
             self.assertTrue(store.maybe_roll_business_day())
-        self.assertEqual(store.storage.reports, ["2026-10"])
+        self.assertEqual(store.storage.reports, ["2026-10-17"])
         self.assertEqual(store.business_date, "2026-10-18")
         self.assertEqual(store.total_in, 0)
         self.assertIn("BUSINESS_DAY_STARTED", [item[0] for item in store.storage.health])
@@ -202,6 +202,10 @@ class CounterStateTests(unittest.TestCase):
         store.cfg.zone_x2 = 300
         store.cfg.zone_y2 = 200
         store.cfg.line_position_ratio = 0.5
+        store.cfg.zone_polygon = ((10, 20), (300, 20), (300, 200), (10, 200))
+        store.cfg.line_p1 = (10, 110)
+        store.cfg.line_p2 = (300, 110)
+        store.cfg.inside_sign = 1
         store.cfg.line_hysteresis = 15
         store.cfg.in_direction = "top_to_bottom"
         store.cfg.crossing_cooldown_s = 0.75
@@ -210,6 +214,8 @@ class CounterStateTests(unittest.TestCase):
             "base_width": 640, "base_height": 360,
             "zone_x1": 200, "zone_y1": 30,
             "zone_x2": 500, "zone_y2": 300,
+            "zone_polygon": [[200, 30], [500, 30], [500, 300], [200, 300]],
+            "line_p1": [210, 200], "line_p2": [490, 240], "inside_sign": 1,
             "line_position_ratio": 0.75,
             "line_hysteresis": 8,
             "in_direction": "bottom_to_top",
@@ -217,7 +223,7 @@ class CounterStateTests(unittest.TestCase):
         })
         self.assertEqual(store.zone, (200, 30, 500, 300))
         self.assertEqual(store.cfg.in_direction, "bottom_to_top")
-        self.assertEqual(store.count_line_y, 232.5)
+        self.assertEqual(store.line_p1, (210.0, 200.0))
         self.assertEqual(store.total_in, 4)
         self.assertEqual(store.tracker.tracks, [])
 

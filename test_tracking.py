@@ -67,6 +67,24 @@ class TrackingTests(unittest.TestCase):
         track = counter.Track([220, 140, 80, 180], 9)
         self.assertEqual(track.get_count_point(), (220.0, 230.0))
 
+    def test_diagonal_line_counts_outside_to_inside(self):
+        track = counter.Track([70, -20, 40, 100], 10)  # foot=(70, 30), outside
+        self.assertIsNone(track.check_polygon_crossing(
+            (0, 0), (100, 100), 1, 5, 1, 0.75
+        ))
+        track.predict()
+        track.update([70, -20, 40, 100])
+        self.assertIsNone(track.check_polygon_crossing(
+            (0, 0), (100, 100), 1, 5, 2, 0.75
+        ))
+        for tick in (3, 4):
+            track.predict()
+            track.update([30, 20, 40, 100])  # foot=(30, 70), inside
+            event = track.check_polygon_crossing(
+                (0, 0), (100, 100), 1, 5, tick, 0.75
+            )
+        self.assertEqual(event, "IN")
+
     def test_normal_entry_and_exit(self):
         t = self.new_track()
         self.assertIsNone(t.check_crossing(100, 10, 1000, 0.75))
@@ -158,9 +176,11 @@ class StaffUniformTests(unittest.TestCase):
         cv2.rectangle(frame, (50, 50), (250, 450), (245, 245, 245), -1)
         evidence = self.detector.analyze(frame, [150, 250, 200, 400])
         self.assertTrue(evidence.usable)
-        self.assertEqual(evidence.score, 0.0)
+        self.assertGreaterEqual(evidence.white_ratio, self.detector.white_min_ratio)
+        self.assertLess(evidence.gray_ratio, self.detector.gray_min_ratio)
+        self.assertLess(evidence.score, self.detector.frame_threshold)
 
-    def test_reference_logo_on_white_shirt_is_strong_evidence(self):
+    def test_reference_logo_cannot_confirm_without_gray_trousers(self):
         reference = self.detector._read_image(self.detector.reference_path)
         logo = self.detector._crop_nonwhite(reference)
         logo = cv2.resize(logo, (140, 140), interpolation=cv2.INTER_AREA)
@@ -169,30 +189,117 @@ class StaffUniformTests(unittest.TestCase):
         frame[120:260, 80:220] = logo
         evidence = self.detector.analyze(frame, [150, 250, 200, 400])
         self.assertGreaterEqual(evidence.feature_inliers, 4)
+        self.assertLess(evidence.score, self.detector.frame_threshold)
+
+    def test_back_view_clothing_layout_is_strong_without_logo(self):
+        frame = np.full((500, 300, 3), 45, dtype=np.uint8)
+        cv2.rectangle(frame, (50, 50), (250, 270), (245, 245, 245), -1)
+        cv2.rectangle(frame, (50, 270), (250, 294), (25, 25, 25), -1)
+        cv2.rectangle(frame, (50, 294), (250, 450), (145, 145, 145), -1)
+        evidence = self.detector.analyze(frame, [150, 250, 200, 400])
+        self.assertGreaterEqual(evidence.white_ratio, self.detector.white_min_ratio)
+        self.assertGreaterEqual(evidence.gray_ratio, self.detector.gray_min_ratio)
+        self.assertGreaterEqual(evidence.belt_ratio, self.detector.belt_min_ratio)
         self.assertGreaterEqual(evidence.score, self.detector.frame_threshold)
+
+    def test_white_and_gray_without_belt_or_logo_is_staff_evidence(self):
+        frame = np.full((500, 300, 3), 25, dtype=np.uint8)
+        cv2.rectangle(frame, (50, 50), (250, 285), (245, 245, 245), -1)
+        cv2.rectangle(frame, (50, 285), (250, 450), (145, 145, 145), -1)
+        evidence = self.detector.analyze(frame, [150, 250, 200, 400])
+        self.assertTrue(evidence.usable)
+        self.assertGreaterEqual(evidence.white_ratio, self.detector.white_min_ratio)
+        self.assertGreaterEqual(evidence.gray_ratio, self.detector.gray_min_ratio)
+        self.assertLess(evidence.belt_ratio, self.detector.belt_min_ratio)
+        self.assertGreaterEqual(evidence.score, self.detector.frame_threshold)
+
+    def test_gray_only_is_not_staff_evidence(self):
+        frame = np.full((500, 300, 3), 145, dtype=np.uint8)
+        evidence = self.detector.analyze(frame, [150, 250, 200, 400])
+        self.assertLess(evidence.white_ratio, self.detector.white_min_ratio)
+        self.assertGreaterEqual(evidence.gray_ratio, self.detector.gray_min_ratio)
+        self.assertLess(evidence.score, self.detector.frame_threshold)
+
+    def test_partial_person_is_unusable(self):
+        frame = np.full((240, 220, 3), 145, dtype=np.uint8)
+        evidence = self.detector.analyze(frame, [110, 220, 160, 300])
+        self.assertFalse(evidence.usable)
 
     def test_repeated_strong_evidence_marks_track_as_staff(self):
         track = counter.Track([150, 250, 200, 400], 99)
         evidence = StaffEvidence(score=0.90, usable=True)
         self.detector.update_track(track, evidence)
-        self.detector.update_track(track, evidence)
+        self.assertEqual(track.staff_status, 'STAFF')
+
+    def test_two_regular_positive_frames_mark_staff_and_stay_sticky(self):
+        detector = StaffUniformDetector(
+            None, enabled=True, frame_threshold=0.54, track_threshold=0.58,
+            strong_frame_threshold=0.78, min_positive_frames=2,
+        )
+        track = counter.Track([150, 250, 200, 400], 101)
+        positive = StaffEvidence(score=0.62, white_ratio=.4, gray_ratio=.4, usable=True)
+        negative = StaffEvidence(score=0.1, usable=True)
+        detector.update_track(track, positive)
         self.assertEqual(track.staff_status, 'UNKNOWN')
-        self.detector.update_track(track, evidence)
+        detector.update_track(track, positive)
+        self.assertEqual(track.staff_status, 'STAFF')
+        for _ in range(10):
+            detector.update_track(track, negative)
         self.assertEqual(track.staff_status, 'STAFF')
 
     def test_weak_evidence_defaults_to_customer(self):
         track = counter.Track([150, 250, 200, 400], 100)
         evidence = StaffEvidence(score=0.10, usable=True)
-        for _ in range(3):
+        for _ in range(self.detector.min_decision_frames):
             self.detector.update_track(track, evidence)
         self.assertEqual(track.staff_status, 'CUSTOMER')
+
+    def test_clear_absence_of_both_uniform_colours_needs_four_fast_frames(self):
+        track = counter.Track([150, 250, 200, 400], 103)
+        evidence = StaffEvidence(
+            score=0.05, white_ratio=0.01, gray_ratio=0.01,
+            upper_visible=True, lower_visible=True, usable=True,
+        )
+        for _ in range(3):
+            self.assertEqual(self.detector.update_track(track, evidence), 'UNKNOWN')
+            self.assertFalse(track.uniform_clear_customer)
+        self.assertEqual(self.detector.update_track(track, evidence), 'CUSTOMER')
+        self.assertTrue(track.uniform_clear_customer)
+
+    def test_one_uniform_colour_does_not_take_fast_customer_path(self):
+        track = counter.Track([150, 250, 200, 400], 104)
+        evidence = StaffEvidence(
+            score=0.20,
+            white_ratio=self.detector.white_min_ratio * 1.2,
+            gray_ratio=0.01,
+            upper_visible=True, lower_visible=True, usable=True,
+        )
+        self.assertEqual(self.detector.update_track(track, evidence), 'UNKNOWN')
+        self.assertFalse(track.uniform_clear_customer)
+
+    def test_plausible_partial_white_and_gray_does_not_become_customer(self):
+        track = counter.Track([150, 250, 200, 400], 102)
+        evidence = StaffEvidence(
+            score=self.detector.frame_threshold - 0.01,
+            white_ratio=self.detector.white_min_ratio * 0.80,
+            gray_ratio=self.detector.gray_min_ratio * 0.80,
+            upper_visible=True,
+            lower_visible=True,
+            usable=True,
+        )
+        for _ in range(self.detector.min_negative_frames + 3):
+            self.detector.update_track(track, evidence)
+        self.assertEqual(track.staff_status, 'UNKNOWN')
+        self.assertTrue(self.detector.has_partial_staff_evidence(track))
 
 
 class CrossingDecisionTests(unittest.TestCase):
     def new_counter(self):
         store = counter.StoreCounter.__new__(counter.StoreCounter)
         store.cfg = types.SimpleNamespace(staff_decision_timeout_s=1.25)
-        store.staff_detector = types.SimpleNamespace(ready=True)
+        store.staff_detector = types.SimpleNamespace(
+            ready=True, has_partial_staff_evidence=lambda track: False
+        )
         store.pending_crossings = []
         store.staff_ignored = 0
         store.unknown_crossings = 0
@@ -225,6 +332,18 @@ class CrossingDecisionTests(unittest.TestCase):
         self.assertEqual(store.staff_ignored, 1)
         self.assertIn('STAFF_IN_IGNORED', store.logged)
 
+    def test_pending_crossing_partial_uniform_biases_to_staff_once(self):
+        store = self.new_counter()
+        store.staff_detector.has_partial_staff_evidence = lambda track: True
+        track = counter.Track([150, 50, 100, 200], 9)
+        store._handle_crossing(track, 'IN', 10.0)
+        store._handle_crossing(track, 'IN', 10.1)
+        self.assertEqual(len(store.pending_crossings), 1)
+        store._resolve_pending_crossings(11.3)
+        self.assertEqual(store.total_in, 0)
+        self.assertEqual(store.staff_ignored, 1)
+        self.assertEqual(store.logged.count('STAFF_IN_IGNORED'), 1)
+
 
 class HybridStaffDecisionTests(unittest.TestCase):
     def new_counter(self):
@@ -248,9 +367,19 @@ class HybridStaffDecisionTests(unittest.TestCase):
         track.face_observations = 2
         self.assertEqual(store._update_hybrid_staff_status(track), 'STAFF')
 
-    def test_supporting_face_plus_white_uniform_marks_staff(self):
+    def test_confirmed_uniform_marks_staff_despite_negative_face(self):
         store = self.new_counter()
         track = counter.Track([150, 250, 200, 400], 11)
+        track.uniform_status = 'STAFF'
+        track.face_employee = 'employee_01'
+        track.face_scores.extend([(0.10, 'employee_01'), (0.12, 'employee_01')])
+        track.face_score = 0.11
+        track.face_observations = 3
+        self.assertEqual(store._update_hybrid_staff_status(track), 'STAFF')
+
+    def test_weak_face_plus_unconfirmed_uniform_stays_unknown(self):
+        store = self.new_counter()
+        track = counter.Track([150, 250, 200, 400], 13)
         track.uniform_status = 'CUSTOMER'
         track.face_employee = 'employee_01'
         track.face_scores.extend([(0.31, 'employee_01'), (0.32, 'employee_01')])
@@ -259,7 +388,7 @@ class HybridStaffDecisionTests(unittest.TestCase):
         track.staff_last_evidence = StaffEvidence(
             score=0.1, white_ratio=0.60, usable=True
         )
-        self.assertEqual(store._update_hybrid_staff_status(track), 'STAFF')
+        self.assertEqual(store._update_hybrid_staff_status(track), 'UNKNOWN')
 
     def test_repeated_negative_face_and_uniform_marks_customer(self):
         store = self.new_counter()
@@ -270,6 +399,24 @@ class HybridStaffDecisionTests(unittest.TestCase):
         track.face_score = 0.11
         track.face_observations = 3
         self.assertEqual(store._update_hybrid_staff_status(track), 'CUSTOMER')
+
+    def test_clear_nonuniform_is_customer_without_waiting_for_face_history(self):
+        store = self.new_counter()
+        track = counter.Track([150, 250, 200, 400], 14)
+        track.uniform_status = 'CUSTOMER'
+        track.uniform_clear_customer = True
+        self.assertEqual(store._update_hybrid_staff_status(track), 'CUSTOMER')
+
+    def test_confirmed_face_overrides_clear_nonuniform(self):
+        store = self.new_counter()
+        track = counter.Track([150, 250, 200, 400], 15)
+        track.uniform_status = 'CUSTOMER'
+        track.uniform_clear_customer = True
+        track.face_employee = 'employee_01'
+        track.face_scores.extend([(0.50, 'employee_01')])
+        track.face_score = 0.50
+        track.face_observations = 1
+        self.assertEqual(store._update_hybrid_staff_status(track), 'STAFF')
 
 
 class BranchConfigTests(unittest.TestCase):
@@ -320,7 +467,9 @@ class FaceProfileTests(unittest.TestCase):
 
             replacement = np.ones((2, 128), dtype=np.float32)
             recognizer.save_employee('employee_01', replacement)
-            self.assertEqual(recognizer.embeddings.shape, (2, 128))
+            # The previous session is preserved; identical new vectors are
+            # deduplicated so the profile does not grow with copies.
+            self.assertEqual(recognizer.embeddings.shape, (4, 128))
 
 if __name__ == '__main__':
     unittest.main()

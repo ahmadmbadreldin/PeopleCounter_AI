@@ -253,12 +253,27 @@ class StaffFaceRecognizer:
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
         vectors = vectors / np.maximum(norms, 1e-8)
 
-        keep = self.employee_ids != employee_id
-        old_ids = self.employee_ids[keep]
-        old_vectors = self.embeddings[keep]
-        new_ids = np.asarray([employee_id] * len(vectors), dtype=str)
+        keep_other = self.employee_ids != employee_id
+        old_ids = self.employee_ids[keep_other]
+        old_vectors = self.embeddings[keep_other]
+        employee_vectors = [
+            vector.copy() for vector in self.embeddings[self.employee_ids == employee_id]
+        ]
+        for vector in vectors:
+            if not employee_vectors or max(
+                float(existing @ vector) for existing in employee_vectors
+            ) < 0.9995:
+                employee_vectors.append(vector.copy())
+        # Multiple sessions improve lighting/angle coverage without allowing
+        # one employee profile to grow forever.
+        employee_vectors = employee_vectors[-80:]
+        employee_array = np.asarray(employee_vectors, dtype=np.float32)
+        new_ids = np.asarray([employee_id] * len(employee_array), dtype=str)
         all_ids = np.concatenate((old_ids, new_ids))
-        all_vectors = np.vstack((old_vectors, vectors)) if len(old_vectors) else vectors
+        all_vectors = (
+            np.vstack((old_vectors, employee_array))
+            if len(old_vectors) else employee_array
+        )
 
         self.profile_file.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.profile_file.with_suffix(self.profile_file.suffix + ".tmp")
@@ -271,5 +286,5 @@ class StaffFaceRecognizer:
             )
         os.replace(temporary, self.profile_file)
         self.load_profiles()
-        return len(vectors)
+        return len(employee_array)
 

@@ -96,13 +96,30 @@ class Config:
         _setting("staff", "enrollment_reference_dir", "")
         or f"branches/{_BRANCH_CONFIG.get('branch_id', 'default_branch')}/uniform_refs"
     ))
+    staff_profile_file: str = str(resolve_project_path(
+        _setting("staff", "profile_file", "")
+        or f"branches/{_BRANCH_CONFIG.get('branch_id', 'default_branch')}/uniform_profile.json"
+    ))
     staff_min_person_width: int = int(_setting("staff", "min_person_width", 70))
     staff_min_person_height: int = int(_setting("staff", "min_person_height", 130))
-    staff_white_min_ratio: float = float(_setting("staff", "white_min_ratio", 0.30))
-    staff_frame_threshold: float = float(_setting("staff", "frame_threshold", 0.56))
-    staff_track_threshold: float = float(_setting("staff", "track_threshold", 0.60))
-    staff_min_positive_frames: int = int(_setting("staff", "min_positive_frames", 3))
-    staff_decision_timeout_s: float = float(_setting("staff", "decision_timeout_s", 2.50))
+    staff_white_min_ratio: float = float(_setting("staff", "white_min_ratio", 0.25))
+    staff_gray_min_ratio: float = float(_setting("staff", "gray_min_ratio", 0.22))
+    staff_belt_min_ratio: float = float(_setting("staff", "belt_min_ratio", 0.18))
+    staff_frame_threshold: float = float(_setting("staff", "frame_threshold", 0.54))
+    staff_track_threshold: float = float(_setting("staff", "track_threshold", 0.58))
+    staff_strong_frame_threshold: float = float(_setting("staff", "strong_frame_threshold", 0.78))
+    staff_min_positive_frames: int = int(_setting("staff", "min_positive_frames", 2))
+    staff_min_negative_frames: int = int(_setting(
+        "staff", "min_negative_frames", _setting("staff", "min_decision_frames", 6)
+    ))
+    staff_process_every_n_frames: int = max(
+        1, int(_setting("staff", "process_every_n_frames", 2))
+    )
+    staff_decision_timeout_s: float = float(_setting("staff", "decision_timeout_s", 3.50))
+    staff_belt_bonus: float = float(_setting("staff", "belt_bonus", 0.05))
+    staff_logo_bonus: float = float(_setting("staff", "logo_bonus", 0.10))
+    staff_fast_customer_factor: float = float(_setting("staff", "fast_customer_factor", 0.55))
+    staff_fast_customer_frames: int = int(_setting("staff", "fast_customer_frames", 4))
 
     # ---------- Per-branch staff face recognition ----------
     face_detection_enabled: bool = bool(_setting("face", "enabled", True))
@@ -131,6 +148,16 @@ class Config:
     zone_y1: int = int(_setting("counting", "zone_y1", 170))
     zone_x2: int = int(_setting("counting", "zone_x2", 450))
     zone_y2: int = int(_setting("counting", "zone_y2", 260))
+    zone_polygon: tuple = tuple(
+        tuple(map(float, point))
+        for point in _setting(
+            "counting", "zone_polygon",
+            [[150, 170], [450, 170], [450, 260], [150, 260]],
+        )
+    )
+    line_p1: tuple = tuple(map(float, _setting("counting", "line_p1", [150, 215])))
+    line_p2: tuple = tuple(map(float, _setting("counting", "line_p2", [450, 215])))
+    inside_sign: int = int(_setting("counting", "inside_sign", 1))
     line_position_ratio: float = float(_setting("counting", "line_position_ratio", 0.50))
     in_direction: str = str(_setting("counting", "in_direction", "top_to_bottom"))
     line_hysteresis: int = int(_setting("counting", "line_hysteresis", 15))
@@ -228,7 +255,8 @@ def counting_signature(config):
     counting = config.get("counting", {})
     keys = (
         "base_width", "base_height", "zone_x1", "zone_y1", "zone_x2",
-        "zone_y2", "line_position_ratio", "in_direction", "line_hysteresis",
+        "zone_y2", "zone_polygon", "line_p1", "line_p2", "inside_sign",
+        "line_position_ratio", "in_direction", "line_hysteresis",
         "crossing_cooldown_s",
     )
     return tuple(counting.get(key) for key in keys)
@@ -317,9 +345,12 @@ class Track:
         self.last_event_time = 0.0
         self.last_event = None
         self.staff_scores = deque(maxlen=20)
+        self.staff_negative_frames = 0
         self.staff_score = 0.0
         self.staff_status = "UNKNOWN"
         self.uniform_status = "UNKNOWN"
+        self.uniform_clear_customer = False
+        self.uniform_clear_customer_frames = 0
         self.staff_last_evidence = None
         self.face_scores = deque(maxlen=24)
         self.face_score = 0.0
@@ -404,6 +435,59 @@ class Track:
         if self.candidate_frames >= min_stable_frames:
             self.count_side = new_side
         return previous, self.count_side
+
+    def update_polygon_side(
+        self, line_p1, line_p2, inside_sign, hysteresis, min_stable_frames=2
+    ):
+        """Update stable OUTSIDE/INSIDE state relative to an arbitrary line."""
+        if self.time_since_update != 0:
+            return self.count_side, self.count_side
+        if self.recovered_after_gap:
+            self.count_side = None
+            self.candidate_side = None
+            self.candidate_frames = 0
+            self.recovered_after_gap = False
+        foot_x, foot_y = self.get_count_point()
+        x1, y1 = line_p1
+        x2, y2 = line_p2
+        dx, dy = x2 - x1, y2 - y1
+        length = max(1.0, float(np.hypot(dx, dy)))
+        signed_distance = ((dx * (foot_y - y1)) - (dy * (foot_x - x1))) / length
+        directed_distance = signed_distance * int(inside_sign)
+        if directed_distance > hysteresis:
+            new_side = "INSIDE"
+        elif directed_distance < -hysteresis:
+            new_side = "OUTSIDE"
+        else:
+            self.candidate_side = None
+            self.candidate_frames = 0
+            return self.count_side, self.count_side
+        if new_side != self.candidate_side:
+            self.candidate_side = new_side
+            self.candidate_frames = 1
+        else:
+            self.candidate_frames += 1
+        previous = self.count_side
+        if self.candidate_frames >= min_stable_frames:
+            self.count_side = new_side
+        return previous, self.count_side
+
+    def check_polygon_crossing(
+        self, line_p1, line_p2, inside_sign, hysteresis, now, cooldown
+    ):
+        if self.time_since_update != 0:
+            return None
+        previous, current = self.update_polygon_side(
+            line_p1, line_p2, inside_sign, hysteresis
+        )
+        if previous not in ("OUTSIDE", "INSIDE") or current == previous:
+            return None
+        if now - self.last_event_time < cooldown:
+            return None
+        event = "IN" if previous == "OUTSIDE" and current == "INSIDE" else "OUT"
+        self.last_event = event
+        self.last_event_time = now
+        return event
 
     def check_crossing(self, line_y: float, hysteresis: float, now: float,
                        cooldown: float, in_direction="top_to_bottom"):
@@ -664,18 +748,28 @@ class StoreCounter:
         self.staff_detector = StaffUniformDetector(
             reference_path=cfg.staff_logo_reference,
             enrollment_reference_dir=cfg.staff_enrollment_reference_dir,
+            profile_path=cfg.staff_profile_file,
             enabled=cfg.staff_detection_enabled,
             min_person_width=cfg.staff_min_person_width,
             min_person_height=cfg.staff_min_person_height,
             white_min_ratio=cfg.staff_white_min_ratio,
+            gray_min_ratio=cfg.staff_gray_min_ratio,
+            belt_min_ratio=cfg.staff_belt_min_ratio,
             frame_threshold=cfg.staff_frame_threshold,
             track_threshold=cfg.staff_track_threshold,
+            strong_frame_threshold=cfg.staff_strong_frame_threshold,
             min_positive_frames=cfg.staff_min_positive_frames,
+            min_negative_frames=cfg.staff_min_negative_frames,
+            belt_bonus=cfg.staff_belt_bonus,
+            logo_bonus=cfg.staff_logo_bonus,
+            fast_customer_factor=cfg.staff_fast_customer_factor,
+            fast_customer_frames=cfg.staff_fast_customer_frames,
         )
         if self.staff_detector.ready:
             print(
-                "Staff uniform detection enabled from enrolled references: "
-                f"{cfg.staff_enrollment_reference_dir}"
+                "Staff uniform detection enabled (white upper + gray trousers; "
+                f"logo references={'yes' if self.staff_detector.logo_ready else 'no'}, "
+                f"branch profile={'yes' if self.staff_detector.profile_ready else 'no'})"
             )
         elif cfg.staff_detection_enabled:
             print(
@@ -715,9 +809,9 @@ class StoreCounter:
         self.pending_crossings = []
 
         self.zone = (cfg.zone_x1, cfg.zone_y1, cfg.zone_x2, cfg.zone_y2)
-        self.count_line_y = cfg.zone_y1 + (
-            (cfg.zone_y2 - cfg.zone_y1) * cfg.line_position_ratio
-        )
+        self.zone_polygon = tuple(cfg.zone_polygon)
+        self.line_p1 = tuple(cfg.line_p1)
+        self.line_p2 = tuple(cfg.line_p2)
         self.line_hysteresis = cfg.line_hysteresis
 
         self.track_colors = {}
@@ -743,18 +837,20 @@ class StoreCounter:
     def scaled_geometry(self, width, height):
         sx = width / self.cfg.base_width
         sy = height / self.cfg.base_height
-        zone = (
-            int(self.cfg.zone_x1 * sx),
-            int(self.cfg.zone_y1 * sy),
-            int(self.cfg.zone_x2 * sx),
-            int(self.cfg.zone_y2 * sy),
+        polygon = tuple(
+            (int(round(x * sx)), int(round(y * sy)))
+            for x, y in self.cfg.zone_polygon
         )
-        base_line_y = self.cfg.zone_y1 + (
-            (self.cfg.zone_y2 - self.cfg.zone_y1) * self.cfg.line_position_ratio
+        line_p1 = (
+            int(round(self.cfg.line_p1[0] * sx)),
+            int(round(self.cfg.line_p1[1] * sy)),
         )
-        line_y = base_line_y * sy
-        hysteresis = self.cfg.line_hysteresis * sy
-        return zone, line_y, hysteresis
+        line_p2 = (
+            int(round(self.cfg.line_p2[0] * sx)),
+            int(round(self.cfg.line_p2[1] * sy)),
+        )
+        hysteresis = self.cfg.line_hysteresis * ((sx + sy) / 2.0)
+        return polygon, line_p1, line_p2, hysteresis
 
     def apply_counting_config(self, counting):
         """Apply a newly saved doorway without resetting persisted totals."""
@@ -765,14 +861,20 @@ class StoreCounter:
             setattr(self.cfg, key, int(counting[key]))
         self.cfg.in_direction = str(counting["in_direction"])
         self.cfg.line_position_ratio = float(counting.get("line_position_ratio", 0.50))
+        self.cfg.zone_polygon = tuple(
+            tuple(map(float, point)) for point in counting["zone_polygon"]
+        )
+        self.cfg.line_p1 = tuple(map(float, counting["line_p1"]))
+        self.cfg.line_p2 = tuple(map(float, counting["line_p2"]))
+        self.cfg.inside_sign = int(counting["inside_sign"])
         self.cfg.crossing_cooldown_s = float(counting["crossing_cooldown_s"])
         self.zone = (
             self.cfg.zone_x1, self.cfg.zone_y1,
             self.cfg.zone_x2, self.cfg.zone_y2,
         )
-        self.count_line_y = self.cfg.zone_y1 + (
-            (self.cfg.zone_y2 - self.cfg.zone_y1) * self.cfg.line_position_ratio
-        )
+        self.zone_polygon = tuple(self.cfg.zone_polygon)
+        self.line_p1 = tuple(self.cfg.line_p1)
+        self.line_p2 = tuple(self.cfg.line_p2)
         self.line_hysteresis = self.cfg.line_hysteresis
         # Old track-side history belongs to the old line and could fabricate a
         # crossing immediately after calibration changes.
@@ -849,9 +951,10 @@ class StoreCounter:
     def process_frame(self, frame):
         self.maybe_roll_business_day()
         height, width = frame.shape[:2]
-        zone, line_y, hysteresis = self.scaled_geometry(width, height)
-        self.zone = zone
-        self.count_line_y = line_y
+        polygon, line_p1, line_p2, hysteresis = self.scaled_geometry(width, height)
+        self.zone_polygon = polygon
+        self.line_p1 = line_p1
+        self.line_p2 = line_p2
 
         self.frame_counter += 1
         self._fps_frames += 1
@@ -883,10 +986,19 @@ class StoreCounter:
         for track in tracks:
             if not self.is_valid_object(track):
                 continue
-            evidence = self.staff_detector.analyze(frame, track.last_observed_bbox)
-            track.uniform_status = self.staff_detector.update_track(track, evidence)
+            if (
+                track.staff_status != "STAFF"
+                and track.time_since_update == 0
+                and self.frame_counter % self.cfg.staff_process_every_n_frames == 0
+            ):
+                evidence = self.staff_detector.analyze(frame, track.last_observed_bbox)
+                track.uniform_status = self.staff_detector.update_track(track, evidence)
 
             if (
+                track.staff_status != "STAFF"
+                and
+                track.time_since_update == 0
+                and
                 self.face_recognizer.ready
                 and self.frame_counter % self.cfg.face_process_every_n_frames == 0
             ):
@@ -901,17 +1013,18 @@ class StoreCounter:
         for track in tracks:
             if not self.is_valid_object(track):
                 continue
-            # Count only observed tracks whose foot point intersects the
-            # configured horizontal segment, not people outside the entrance.
-            foot_x, _foot_y = track.get_count_point()
-            if not (zone[0] <= foot_x <= zone[2]):
+            # Only points inside the calibrated entrance polygon can count.
+            foot_x, foot_y = track.get_count_point()
+            contour = np.asarray(polygon, dtype=np.float32)
+            if cv2.pointPolygonTest(contour, (foot_x, foot_y), False) < 0:
                 continue
-            event = track.check_crossing(
-                line_y,
+            event = track.check_polygon_crossing(
+                line_p1,
+                line_p2,
+                self.cfg.inside_sign,
                 hysteresis,
                 now,
                 self.cfg.crossing_cooldown_s,
-                self.cfg.in_direction,
             )
 
             if event is not None:
@@ -929,10 +1042,12 @@ class StoreCounter:
             self.storage.save_state(self.state_snapshot())
             self._last_state_save = now_mono
 
-        return self.draw(frame, tracks, zone, line_y, hysteresis, current_inside)
+        return self.draw(
+            frame, tracks, polygon, line_p1, line_p2, hysteresis, current_inside
+        )
 
     def _update_hybrid_staff_status(self, track):
-        """Favor staff recall while requiring repeated track-level evidence."""
+        """Mark staff when either face OR uniform is independently confirmed."""
         if not self.face_recognizer.ready:
             track.staff_status = track.uniform_status
             return track.staff_status
@@ -951,23 +1066,15 @@ class StoreCounter:
                 for score in matching_scores
             )
         )
-        face_support = (
-            len(matching_scores) >= self.cfg.face_min_positive_frames
-            and track.face_score >= self.cfg.face_support_threshold
-        )
-        last_uniform = track.staff_last_evidence
-        white_support = bool(
-            last_uniform is not None
-            and last_uniform.usable
-            and last_uniform.white_ratio >= self.cfg.staff_white_min_ratio
-        )
-
-        if (
-            face_confirmed
-            or track.uniform_status == "STAFF"
-            or (face_support and white_support)
-        ):
+        # Strict OR: either recognizer may confirm staff on its own.  Weak
+        # evidence from both recognizers is not combined into a confirmation.
+        if face_confirmed or track.uniform_status == "STAFF":
             track.staff_status = "STAFF"
+        elif (
+            track.uniform_status == "CUSTOMER"
+            and getattr(track, "uniform_clear_customer", False)
+        ):
+            track.staff_status = "CUSTOMER"
         elif (
             track.face_observations >= 3
             and track.face_score < self.cfg.face_support_threshold
@@ -985,11 +1092,17 @@ class StoreCounter:
             self._commit_crossing(track, event, "CUSTOMER")
         else:
             # Keep the event while later frames provide a better torso/logo view.
-            self.pending_crossings.append({
-                "track": track,
-                "event": event,
-                "created": now,
-            })
+            duplicate = any(
+                pending["track"].track_id == track.track_id
+                and pending["event"] == event
+                for pending in self.pending_crossings
+            )
+            if not duplicate:
+                self.pending_crossings.append({
+                    "track": track,
+                    "event": event,
+                    "created": now,
+                })
 
     def _resolve_pending_crossings(self, now):
         remaining = []
@@ -1000,7 +1113,13 @@ class StoreCounter:
             elif track.staff_status == "CUSTOMER":
                 self._commit_crossing(track, pending["event"], "CUSTOMER")
             elif now - pending["created"] >= self.cfg.staff_decision_timeout_s:
-                self._commit_crossing(track, pending["event"], "UNKNOWN")
+                partial_check = getattr(
+                    self.staff_detector, "has_partial_staff_evidence", lambda _track: False
+                )
+                if partial_check(track):
+                    self._commit_crossing(track, pending["event"], "STAFF")
+                else:
+                    self._commit_crossing(track, pending["event"], "UNKNOWN")
             else:
                 remaining.append(pending)
         self.pending_crossings = remaining
@@ -1038,23 +1157,40 @@ class StoreCounter:
             f"INSIDE={max(0, self.total_in - self.total_out)}"
         )
 
-    def draw(self, frame, tracks, zone, line_y, hysteresis, current_inside):
+    def draw(self, frame, tracks, polygon, line_p1, line_p2, hysteresis, current_inside):
         overlay = frame.copy()
-        cv2.rectangle(overlay, (zone[0], zone[1]), (zone[2], zone[3]), (0, 255, 255), -1)
+        contour = np.asarray(polygon, dtype=np.int32)
+        cv2.fillPoly(overlay, [contour], (0, 255, 255))
         cv2.addWeighted(overlay, 0.12, frame, 0.88, 0, frame)
-        cv2.rectangle(frame, (zone[0], zone[1]), (zone[2], zone[3]), (0, 255, 255), 2)
+        cv2.polylines(frame, [contour], True, (0, 255, 255), 3)
 
-        band_top = int(line_y - hysteresis)
-        band_bottom = int(line_y + hysteresis)
-        cv2.rectangle(frame, (zone[0], band_top), (zone[2], band_bottom), (255, 180, 0), 2)
-
-        # High-contrast counting line: the black border keeps it visible on
-        # bright floors and the green center keeps its meaning obvious.
-        line_y_int = int(line_y)
-        cv2.line(frame, (zone[0], line_y_int), (zone[2], line_y_int), (0, 0, 0), 8)
-        cv2.line(frame, (zone[0], line_y_int), (zone[2], line_y_int), (0, 255, 0), 4)
-        line_label_x = zone[0] + 8
-        line_label_y = max(24, line_y_int - 12)
+        dx, dy = line_p2[0] - line_p1[0], line_p2[1] - line_p1[1]
+        length = max(1.0, float(np.hypot(dx, dy)))
+        nx, ny = -dy / length, dx / length
+        band = np.asarray([
+            (int(line_p1[0] + nx * hysteresis), int(line_p1[1] + ny * hysteresis)),
+            (int(line_p2[0] + nx * hysteresis), int(line_p2[1] + ny * hysteresis)),
+            (int(line_p2[0] - nx * hysteresis), int(line_p2[1] - ny * hysteresis)),
+            (int(line_p1[0] - nx * hysteresis), int(line_p1[1] - ny * hysteresis)),
+        ], dtype=np.int32)
+        cv2.polylines(frame, [band], True, (255, 180, 0), 2)
+        cv2.line(frame, line_p1, line_p2, (0, 0, 0), 8)
+        cv2.line(frame, line_p1, line_p2, (0, 255, 0), 4)
+        midpoint = (
+            int(round((line_p1[0] + line_p2[0]) / 2.0)),
+            int(round((line_p1[1] + line_p2[1]) / 2.0)),
+        )
+        arrow_end = (
+            int(round(midpoint[0] + nx * self.cfg.inside_sign * 55)),
+            int(round(midpoint[1] + ny * self.cfg.inside_sign * 55)),
+        )
+        cv2.arrowedLine(frame, midpoint, arrow_end, (0, 255, 255), 4, tipLength=0.25)
+        cv2.putText(
+            frame, "IN", (arrow_end[0] + 6, arrow_end[1] - 6),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2, cv2.LINE_AA,
+        )
+        line_label_x = min(line_p1[0], line_p2[0]) + 8
+        line_label_y = max(24, min(line_p1[1], line_p2[1]) - 12)
         cv2.putText(frame, "COUNTING LINE", (line_label_x, line_label_y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 5)
         cv2.putText(frame, "COUNTING LINE", (line_label_x, line_label_y),
@@ -1083,6 +1219,14 @@ class StoreCounter:
             label = f"ID:{track.track_id} {side}"
             if self.staff_detector.ready:
                 label += f" {track.staff_status} U:{track.staff_score:.2f}"
+                evidence = track.staff_last_evidence
+                if evidence is not None and evidence.usable:
+                    label += (
+                        f" W:{evidence.white_ratio:.2f}"
+                        f" G:{evidence.gray_ratio:.2f}"
+                        f" B:{evidence.belt_ratio:.2f}"
+                        f" P:{evidence.profile_similarity:.2f}"
+                    )
             if self.face_recognizer.ready and track.face_employee:
                 label += f" F:{track.face_employee}:{track.face_score:.2f}"
             if track.last_event:
@@ -1092,7 +1236,7 @@ class StoreCounter:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1)
 
         panel_width = min(400, max(320, frame.shape[1] - 20))
-        panel_height = 270
+        panel_height = 185
         panel_x = max(10, frame.shape[1] - panel_width - 10)
         panel_y = 10
         cv2.rectangle(frame, (panel_x, panel_y),
@@ -1113,14 +1257,9 @@ class StoreCounter:
                     metric_font, metric_scale, (0, 255, 0), metric_thickness)
         cv2.putText(frame, f"OUT: {self.total_out}", (panel_x + 16, panel_y + 122),
                     metric_font, metric_scale, (0, 0, 255), metric_thickness)
-        cv2.putText(frame, f"INSIDE: {current_inside}", (panel_x + 16, panel_y + 162),
-                    metric_font, metric_scale, (0, 255, 255), metric_thickness)
         cv2.putText(frame, f"STAFF IGNORED: {self.staff_ignored}",
-                    (panel_x + 16, panel_y + 202), metric_font,
+                    (panel_x + 16, panel_y + 162), metric_font,
                     metric_scale, (255, 0, 255), metric_thickness)
-        cv2.putText(frame, f"UNKNOWN COUNTED: {self.unknown_crossings}",
-                    (panel_x + 16, panel_y + 242), metric_font,
-                    metric_scale, (0, 200, 255), metric_thickness)
 
         return frame
 
@@ -1153,7 +1292,7 @@ class StoreCounter:
             return False
         previous = self.business_date
         self.storage.save_state(self.state_snapshot())
-        self.storage.export_monthly_excel(previous[:7])
+        self.storage.export_daily_excel(previous)
         self.business_date = today
         self.total_in = 0
         self.total_out = 0
@@ -1171,8 +1310,8 @@ class StoreCounter:
         return True
 
     def export_report(self):
-        report = self.storage.export_monthly_excel(self.business_date[:7])
-        LOGGER.info("Monthly report exported: %s", report)
+        report = self.storage.export_daily_excel(self.business_date)
+        LOGGER.info("Daily hourly report exported: %s", report)
         return report
 
     def close(self):
@@ -1337,7 +1476,7 @@ def main():
                 counter.reset()
             elif key == ord("e"):
                 report = counter.export_report()
-                print(f"Monthly Excel report: {report}")
+                print(f"Daily Excel report: {report}")
 
     except KeyboardInterrupt:
         LOGGER.info("Stopped from keyboard")

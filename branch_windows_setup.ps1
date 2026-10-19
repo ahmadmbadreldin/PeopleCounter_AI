@@ -2,15 +2,23 @@ $ErrorActionPreference = 'Stop'
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $pythonw = Join-Path $projectRoot '.venv\Scripts\pythonw.exe'
+$python = Join-Path $projectRoot '.venv\Scripts\python.exe'
 $watchdog = Join-Path $projectRoot 'watchdog.py'
+$systemCheck = Join-Path $projectRoot 'system_check.py'
 $config = Join-Path $projectRoot 'branch_config.json'
 $taskName = 'ColorsBeauty-PeopleCounter'
 
 if (-not (Test-Path -LiteralPath $pythonw)) {
-    throw 'Run "Start People Counter.cmd" once first so the local Python environment is installed.'
+    throw 'Run "1 - Configure Branch.cmd" once first so the local Python environment is installed.'
 }
 if (-not (Test-Path -LiteralPath $config)) {
-    throw 'Configure and save the branch first using "Start People Counter.cmd".'
+    throw 'Configure and save the branch first using "1 - Configure Branch.cmd".'
+}
+
+Write-Host 'Running the production system check before changing Windows settings...'
+& $python $systemCheck
+if ($LASTEXITCODE -ne 0) {
+    throw 'Production system check failed. Fix every [FAIL] item before installing startup.'
 }
 
 $action = New-ScheduledTaskAction `

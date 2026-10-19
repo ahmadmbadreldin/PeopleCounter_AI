@@ -3,22 +3,20 @@ setlocal
 cd /d "%~dp0"
 title People Counter
 
-if not exist ".venv\Scripts\python.exe" (
-    echo Creating the local Python environment...
-    python -m venv .venv
-    if errorlevel 1 goto :error
-)
-
-".venv\Scripts\python.exe" -c "import importlib.util, cv2, numpy, scipy, filterpy, openpyxl; assert importlib.util.find_spec('ultralytics'); assert int(cv2.__version__.split('.')[0]) >= 5" >nul 2>&1
-if errorlevel 1 (
-    echo Installing project requirements. This can take several minutes...
-    ".venv\Scripts\python.exe" -m pip install -r requirements.txt
-    if errorlevel 1 goto :error
-)
+where python >nul 2>&1
+if errorlevel 1 goto :python_missing
+python bootstrap_environment.py
+if errorlevel 1 goto :error
 
 ".venv\Scripts\python.exe" setup_branch.py
 if errorlevel 1 goto :error
 exit /b 0
+
+:python_missing
+echo.
+echo Python was not found. Install 64-bit Python 3.11 and enable "Add Python to PATH".
+pause
+exit /b 1
 
 :error
 echo.

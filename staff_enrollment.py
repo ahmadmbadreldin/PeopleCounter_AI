@@ -31,16 +31,26 @@ def chest_crop(frame, face_box):
 def save_uniform_references(directory, employee_id, samples):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    for old in directory.glob(f"{employee_id}_*.jpg"):
-        old.unlink(missing_ok=True)
-    saved = 0
-    for index, image in enumerate(samples[:9], start=1):
+    existing = sorted(directory.glob(f"{employee_id}_*.jpg"))
+    next_index = 1
+    for path in existing:
+        try:
+            next_index = max(next_index, int(path.stem.rsplit("_", 1)[1]) + 1)
+        except (IndexError, ValueError):
+            continue
+    saved_paths = list(existing)
+    for image in samples[:12]:
         ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 92])
         if not ok:
             continue
-        (directory / f"{employee_id}_{index:02d}.jpg").write_bytes(encoded.tobytes())
-        saved += 1
-    return saved
+        target = directory / f"{employee_id}_{next_index:03d}.jpg"
+        target.write_bytes(encoded.tobytes())
+        saved_paths.append(target)
+        next_index += 1
+    # Keep several sessions/lighting conditions, but bound disk and ORB work.
+    while len(saved_paths) > 30:
+        saved_paths.pop(0).unlink(missing_ok=True)
+    return len(saved_paths)
 
 
 def open_camera(url, config):

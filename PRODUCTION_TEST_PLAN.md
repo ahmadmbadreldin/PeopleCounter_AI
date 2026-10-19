@@ -16,14 +16,14 @@ syntax checks and every `test_*.py` test. The suite currently covers:
 | Door geometry | Bounds, direction, coordinate conversion | Round trip and invalid zones rejected |
 | Tracker | IoU, ID continuity, expiry, reset | No false predicted crossing |
 | Crossing | Normal/reversed direction, hysteresis, gaps | Exactly one correct event |
-| Staff uniform | Blank shirt, logo reference, repeated evidence | Blank shirt never becomes staff |
+| Staff uniform | White upper + gray trousers, optional belt/logo, visibility gating, temporal evidence | White + gray works front/back without belt/logo; one colour alone never confirms staff |
 | Face profiles | Validation, normalization, replacement, corrupt file | No crash; correct employee selected |
 | Enrollment helpers | Pose guidance, chest crop, file replacement | 9 capped valid references |
 | YOLO errors | Transient, recovery, 30 consecutive failures | Continue transiently; escalate persistent fault |
 | Camera state | Disconnect/reconnect events and downtime | One event per transition |
 | Counter state | Reset, snapshot, day rollover | Exact persisted values |
 | SQLite | WAL, schema, atomic event/state, restart | No counter loss after reopen |
-| Excel | Monthly row values and automatic refresh | Monthly Summary matches SQLite |
+| Excel | 24 hourly rows and automatic refresh | Only IN, OUT, and Staff Ignored are exposed and match SQLite |
 | Retention | Old DB rows and reports | Removed at configured age |
 | Heartbeat/status | Fresh, stale, missing, corrupt | Correct healthy/unhealthy exit code |
 | Watchdog | Hung child termination | Terminate then kill fallback |
@@ -32,7 +32,7 @@ syntax checks and every `test_*.py` test. The suite currently covers:
 
 ## 2. Technical branch smoke test
 
-After **Save & Start**, close the counter and run
+After **Save Configuration**, start the counter with **2 - Start Monitoring.cmd**, then run
 `Run Branch Acceptance Test.cmd`. It tests the real environment while skipping
 the live camera connection:
 
@@ -40,6 +40,7 @@ the live camera connection:
 - active branch config and free disk space;
 - real YOLO model load plus an inference;
 - real YuNet/SFace model load;
+- clothing-layout uniform detector with optional logo references;
 - SQLite write/read and Excel creation.
 
 All checks must show `[PASS]`.
@@ -79,10 +80,13 @@ Each consenting employee performs at least 10 entries and 10 exits, including
 front, partial side, natural walking, and the normal branch lighting. Then 30
 customers pass wearing light or white clothing.
 
-- Target: at least 90% of registered staff crossings are ignored.
-- Safety gate: **zero customers may be classified as staff** in the acceptance
-  sample. A customer incorrectly ignored is a release blocker.
-- Every unresolved/unknown crossing must be counted as a customer.
+- Target: at least 95% of uniformed staff crossings are ignored. Missing a staff
+  member and counting them as a customer is the primary release risk.
+- A customer wearing the same white upper + gray trousers may intentionally be
+  classified as staff; record this rate, but it is accepted by the current
+  business policy.
+- Every truly unresolved crossing with no usable uniform evidence is recorded
+  explicitly as `IN_UNKNOWN_COUNTED` or `OUT_UNKNOWN_COUNTED`.
 
 ### Lighting and crowd conditions
 
@@ -116,7 +120,7 @@ For the controlled trial, compare four sources:
 1. observer ground truth;
 2. on-screen IN/OUT counters;
 3. SQLite `events` and `counter_state`;
-4. The current date row in the Excel `Monthly Summary` sheet.
+4. The matching 24-hour row in the daily Excel `Hourly Report` sheet.
 
 The screen, SQLite, and Excel must agree exactly. Any difference is a software
 failure even when the camera accuracy itself is acceptable.

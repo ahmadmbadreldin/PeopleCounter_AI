@@ -53,10 +53,13 @@ class ExcelAndDatabaseTests(unittest.TestCase):
         self.assertEqual(event["inside"], 1)
         self.assertEqual(saved["total_in"], 2)
 
-    def test_monthly_excel_contains_one_live_row_per_day(self):
+    def test_daily_excel_contains_one_row_per_hour(self):
         state = empty_state("2026-10-17")
         state.update(total_in=3, total_out=1, peak_inside=2)
-        self.store.add_event(1, "IN_UNKNOWN_COUNTED", state)
+        with patch.object(
+            self.store, "_now", return_value="2026-10-17T09:15:00+02:00"
+        ):
+            self.store.add_event(1, "IN_UNKNOWN_COUNTED", state)
         with self.store._lock:
             self.store.connection.executemany(
                 """INSERT INTO health_events
@@ -70,18 +73,24 @@ class ExcelAndDatabaseTests(unittest.TestCase):
                 ),
             )
             self.store.connection.commit()
-        report = self.store.export_monthly_excel("2026-10")
+        report = self.store.export_daily_excel("2026-10-17")
         workbook = load_workbook(report, read_only=True, data_only=True)
         try:
-            self.assertEqual(workbook.sheetnames, ["Monthly Summary"])
-            sheet = workbook["Monthly Summary"]
+            self.assertEqual(report.name, "2026-10-17.xlsx")
+            self.assertEqual(workbook.sheetnames, ["Hourly Report"])
+            sheet = workbook["Hourly Report"]
             rows = {row[0]: row for row in sheet.iter_rows(min_row=10, values_only=True)}
-            day = rows["2026-10-17"]
-            self.assertEqual(day[1:7], (3, 1, 2, 2, 0, 1))
-            self.assertEqual(day[7].total_seconds(), 320)
+            self.assertEqual(len(rows), 24)
+            self.assertEqual(
+                tuple(cell.value for cell in sheet[9]),
+                ("Hour (24h)", "IN", "OUT", "Staff Ignored"),
+            )
+            self.assertEqual(rows["00:00 - 00:59"][1:4], (0, 0, 0))
+            hour_09 = rows["09:00 - 09:59"]
+            self.assertEqual(hour_09[1:4], (3, 1, 0))
             self.assertEqual(sheet["B4"].value, 3)
             self.assertEqual(sheet["D4"].value, 1)
-            self.assertEqual(sheet["B6"].value.total_seconds(), 8 * 3600)
+            self.assertEqual(sheet["B5"].value, 0)
         finally:
             workbook.close()
 
@@ -206,6 +215,8 @@ class InstallationArtifactTests(unittest.TestCase):
     def test_all_operator_launchers_exist(self):
         root = Path(__file__).resolve().parent
         for name in (
+            "1 - Configure Branch.cmd",
+            "2 - Start Monitoring.cmd",
             "Start People Counter.cmd",
             "Install Branch PC.cmd",
             "Run People Counter 24-7.cmd",
@@ -215,6 +226,16 @@ class InstallationArtifactTests(unittest.TestCase):
         ):
             with self.subTest(name=name):
                 self.assertTrue((root / name).is_file())
+
+    def test_configuration_and_monitoring_launchers_are_separate(self):
+        root = Path(__file__).resolve().parent
+        configure = (root / "1 - Configure Branch.cmd").read_text(encoding="utf-8")
+        monitor = (root / "2 - Start Monitoring.cmd").read_text(encoding="utf-8")
+        self.assertIn("setup_branch.py --configure-only", configure)
+        self.assertNotIn("watchdog.py", configure)
+        self.assertIn("watchdog.py", monitor)
+        self.assertNotIn("setup_branch.py", monitor)
+        self.assertIn("validate_config", monitor)
 
     def test_stop_script_is_scoped_to_this_project(self):
         root = Path(__file__).resolve().parent
